@@ -7,7 +7,7 @@ Python 3.13 is recommended. Once it's installed, clone the repo, set up dependen
 <details>
 <summary>Windows</summary>
 
-```powershell
+```bash
 # Clone the repo
 git clone https://github.com/the-database/MangaJaNaiTRT.git
 
