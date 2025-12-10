@@ -1,5 +1,9 @@
 # MangaJaNaiTRT
 
+## Overview
+
+MangaJaNaiTRT is a simple command line tool to batch upscale images with ONNX models using TensorRT. It was created as a proof of concept for fast and VRAM-efficient upscaling. If it works well enough its backend will be ported into [MangaJaNaiConverterGui](https://github.com/the-database/MangaJaNaiConverterGui). 
+
 ## Usage
 
 Python 3.13 is recommended. Once it's installed, clone the repo, set up dependencies and download ONNX models:
@@ -69,3 +73,11 @@ To use a different config file, specify it with the `-c` argument:
 ```bash
 python -c otherconfig.ini
 ```
+
+## Resources
+- [OpenModelDB](https://openmodeldb.info/): Repository of AI upscaling models.
+
+## Related Projects
+- [MangaJaNaiConverterGui](https://github.com/the-database/MangaJaNaiConverterGui): Windows GUI for manga upscaling with MangaJaNai models, but does not support TensorRT (yet)
+- [MangaJaNai](https://github.com/the-database/mangajanai): Main repository for manga upscaling models.
+- [traiNNer-redux](https://github.com/the-database/traiNNer-redux): Software for training upscaling models. Includes script for converting PyTorch models to ONNX.
