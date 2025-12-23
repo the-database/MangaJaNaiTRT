@@ -8,8 +8,10 @@ dependencies = [
     "nvidia-ml-py",
     "pyvips",
     "pyvips-binary",
+    "requests",
     "rich",
-    "tensorrt-cu12"
+    "tensorrt-cu12",
+    "urllib3"
 ]
 authors = [{name = "the-database"}]
 description = "Command line tool to batch upscale images with TensorRT"

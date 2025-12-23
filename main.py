@@ -1,5 +1,6 @@
 import argparse
 import os
+import tempfile
 import threading
 import time
 import warnings
@@ -21,7 +22,7 @@ from rich.progress import (
 )
 
 from mangajanaitrt.console import console, dbg
-from mangajanaitrt.img import load_image, save_image
+from mangajanaitrt.img import load_image, save_image, is_url, download_image_to_temp
 from mangajanaitrt.trt_upscaler import TensorRTUpscaler
 from mangajanaitrt.vram_monitor import VRAMMonitor
 
@@ -43,6 +44,7 @@ def load_config(config_path: str | Path = "config.ini"):
     input_path = cfg.get("paths", "input_path")
     input_onnx = cfg.get("paths", "input_onnx")
     output_dir = cfg.get("paths", "output_dir")
+
     engine_cache_dir_raw = cfg.get("paths", "engine_cache_dir", fallback="").strip()
     engine_cache_dir: str | None
     if not engine_cache_dir_raw or engine_cache_dir_raw.lower() in {"none", "null"}:
@@ -171,39 +173,34 @@ def upscale_alpha(alpha: np.ndarray, scale: int) -> np.ndarray:
     img = pyvips.Image.new_from_memory(alpha.tobytes(), w, h, 1, "uchar")
     # Use bicubic (cubic) interpolation for smooth alpha edges
     img = img.resize(scale, kernel="cubic")
-
     return np.ndarray(
         buffer=img.write_to_memory(), dtype=np.uint8, shape=[img.height, img.width]
     )
 
 
 def image_writer_thread(
-    q: "Queue[tuple[np.ndarray, np.ndarray | None, str] | None]",
-    quality: int,
-    webp_lossless: bool,
-    scale: int,
+        q: "Queue[tuple[np.ndarray, np.ndarray | None, str] | None]",
+        quality: int,
+        webp_lossless: bool,
+        scale: int,
 ) -> None:
     while True:
         item = q.get()
         if item is None:
             q.put(None)
             break
-
         rgb, alpha, out_path = item
-
         if alpha is not None:
             result_alpha = upscale_alpha(alpha, scale)
             out_arr = np.dstack([rgb, result_alpha])
         else:
             out_arr = rgb
-
         save_image(out_arr, out_path, quality=quality, webp_lossless=webp_lossless)
 
 
-
 def image_loader_thread(
-    files: list[str],
-    job_q: "Queue[tuple[str, np.ndarray, np.ndarray | None] | None]",
+        files: list[str],
+        job_q: "Queue[tuple[str, np.ndarray, np.ndarray | None] | None]",
 ) -> None:
     for path in files:
         try:
@@ -214,7 +211,23 @@ def image_loader_thread(
     job_q.put(None)
 
 
-def collect_input_files(input_path: str, exts: set[str]) -> list[str]:
+def collect_input_files(input_path: str, exts: set[str], temp_dir: str | None = None) -> list[str]:
+    """
+    Collect input files from a path, which can be:
+    - A local file path
+    - A local directory path
+    - A single URL (http:// or https://)
+
+    For URLs, downloads to temp_dir and returns the temp file path.
+    """
+    # Handle URL input
+    if is_url(input_path):
+        if temp_dir is None:
+            raise ValueError("temp_dir required for URL input")
+        temp_path = download_image_to_temp(input_path, temp_dir)
+        return [temp_path]
+
+    # Handle local paths
     if not os.path.exists(input_path):
         raise FileNotFoundError(input_path)
 
@@ -236,7 +249,6 @@ def main() -> None:
     total_t0 = time.perf_counter()
 
     cfg = load_config(args.config)
-
     vram_monitor = VRAMMonitor(device_id=cfg["DEVICE_ID"])
     vram_monitor.start()
 
@@ -244,114 +256,124 @@ def main() -> None:
         raise FileNotFoundError(f"ONNX not found: {cfg['INPUT_ONNX']}")
 
     exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".avif"}
-    files = collect_input_files(cfg["INPUT_PATH"], exts)
 
-    if not files:
-        raise RuntimeError(f"No images in {cfg['INPUT_PATH']}")
+    # Create temp directory for URL downloads if needed
+    temp_dir = None
+    input_is_url = is_url(cfg["INPUT_PATH"])
 
-    os.makedirs(cfg["OUTPUT_DIR"], exist_ok=True)
+    if input_is_url:
+        temp_dir = tempfile.mkdtemp(prefix="trt_upscale_")
+        console.print(f"[dim]Using temp directory: {temp_dir}[/]")
 
-    console.print(f"[bold]Found {len(files)} image(s)[/]")
-    console.print("\n[bold]Initializing TensorRT...[/]")
+    try:
+        files = collect_input_files(cfg["INPUT_PATH"], exts, temp_dir)
+        if not files:
+            raise RuntimeError(f"No images in {cfg['INPUT_PATH']}")
 
-    upscaler = TensorRTUpscaler(
-        onnx_path=cfg["INPUT_ONNX"],
-        batch_size=cfg["BATCH_SIZE"],
-        use_fp16=cfg["USE_FP16"],
-        use_bf16=cfg["USE_BF16"],
-        device_id=cfg["DEVICE_ID"],
-        engine_cache_dir=cfg["ENGINE_CACHE_DIR"],
-        shape_min=cfg["DYNAMIC_SHAPE_MIN"],
-        shape_opt=cfg["DYNAMIC_SHAPE_OPT"],
-        shape_max=cfg["DYNAMIC_SHAPE_MAX"],
-        tile_align=cfg["TILE_ALIGN"],
-        builder_opt_level=cfg["TRT_OPT_LEVEL"],
-        trt_workspace_gb=cfg["TRT_WORKSPACE_GB"],
-    )
+        os.makedirs(cfg["OUTPUT_DIR"], exist_ok=True)
+        console.print(f"[bold]Found {len(files)} image(s)[/]")
 
-    num_savers = cfg["NUM_SAVE_THREADS"]
-    save_q: Queue[tuple[np.ndarray, np.ndarray | None, str] | None] = Queue(
-        maxsize=cfg["SAVE_QUEUE_MAXSIZE"]
-    )
-    writers = []
-    for _ in range(num_savers):
-        w = threading.Thread(
-            target=image_writer_thread,
-            args=(save_q, cfg["QUALITY"], cfg["WEBP_LOSSLESS"], upscaler.scale),
-            daemon=True,
+        console.print("\n[bold]Initializing TensorRT...[/]")
+        upscaler = TensorRTUpscaler(
+            onnx_path=cfg["INPUT_ONNX"],
+            batch_size=cfg["BATCH_SIZE"],
+            use_fp16=cfg["USE_FP16"],
+            use_bf16=cfg["USE_BF16"],
+            device_id=cfg["DEVICE_ID"],
+            engine_cache_dir=cfg["ENGINE_CACHE_DIR"],
+            shape_min=cfg["DYNAMIC_SHAPE_MIN"],
+            shape_opt=cfg["DYNAMIC_SHAPE_OPT"],
+            shape_max=cfg["DYNAMIC_SHAPE_MAX"],
+            tile_align=cfg["TILE_ALIGN"],
+            builder_opt_level=cfg["TRT_OPT_LEVEL"],
+            trt_workspace_gb=cfg["TRT_WORKSPACE_GB"],
         )
-        w.start()
-        writers.append(w)
 
-    job_q: Queue[tuple[str, np.ndarray, np.ndarray | None] | None] = Queue(
-        maxsize=cfg["PREFETCH_IMAGES"]
-    )
-    loader = threading.Thread(
-        target=image_loader_thread, args=(files, job_q), daemon=True
-    )
-    loader.start()
-
-    total = len(files)
-    progress = make_progress()
-
-    console.print(
-        f"\n[bold]Processing {total} images with {num_savers} saver thread(s)...[/]\n"
-    )
-
-    with progress:
-        task_id = progress.add_task("upscaling", total=total, filename="")
-        done = 0
-
-        while done < total:
-            item = job_q.get()
-            if item is None:
-                break
-
-            path, rgb, alpha = item
-            progress.update(task_id, filename=filename_for_bar(os.path.basename(path)))
-
-            t0 = time.perf_counter()
-
-            result_rgb = upscaler.upscale_image(rgb, overlap=cfg["TILE_OVERLAP"])
-
-            if alpha is not None:
-                result_alpha = upscale_alpha(alpha, upscaler.scale)
-                result = np.dstack([result_rgb, result_alpha])
-            else:
-                result = result_rgb
-
-            dbg(f"{os.path.basename(path)}: {time.perf_counter() - t0:.2f}s")
-
-            out_base = os.path.splitext(os.path.basename(path))[0]
-
-            ext_map = {
-                "png": ".png",
-                "jpg": ".jpg",
-                "webp": ".webp",
-                "avif": ".avif",
-            }
-            out_ext = ext_map[cfg["OUTPUT_FORMAT"]]
-
-            out_path = os.path.join(
-                cfg["OUTPUT_DIR"], f"{out_base}_{cfg['NOTE']}{out_ext}"
+        num_savers = cfg["NUM_SAVE_THREADS"]
+        save_q: Queue[tuple[np.ndarray, np.ndarray | None, str] | None] = Queue(
+            maxsize=cfg["SAVE_QUEUE_MAXSIZE"]
+        )
+        writers = []
+        for _ in range(num_savers):
+            w = threading.Thread(
+                target=image_writer_thread,
+                args=(save_q, cfg["QUALITY"], cfg["WEBP_LOSSLESS"], upscaler.scale),
+                daemon=True,
             )
+            w.start()
+            writers.append(w)
 
-            save_q.put((result_rgb, alpha, out_path))
+        job_q: Queue[tuple[str, np.ndarray, np.ndarray | None] | None] = Queue(
+            maxsize=cfg["PREFETCH_IMAGES"]
+        )
+        loader = threading.Thread(
+            target=image_loader_thread, args=(files, job_q), daemon=True
+        )
+        loader.start()
 
-            progress.update(task_id, advance=1)
-            done += 1
+        total = len(files)
+        progress = make_progress()
+        console.print(
+            f"\n[bold]Processing {total} images with {num_savers} saver thread(s)...[/]\n"
+        )
 
-    save_q.put(None)
-    for w in writers:
-        w.join()
-    loader.join(timeout=1.0)
+        with progress:
+            task_id = progress.add_task("upscaling", total=total, filename="")
+            done = 0
+            while done < total:
+                item = job_q.get()
+                if item is None:
+                    break
+                path, rgb, alpha = item
+                progress.update(task_id, filename=filename_for_bar(os.path.basename(path)))
+
+                t0 = time.perf_counter()
+                result_rgb = upscaler.upscale_image(rgb, overlap=cfg["TILE_OVERLAP"])
+
+                if alpha is not None:
+                    result_alpha = upscale_alpha(alpha, upscaler.scale)
+                    result = np.dstack([result_rgb, result_alpha])
+                else:
+                    result = result_rgb
+
+                dbg(f"{os.path.basename(path)}: {time.perf_counter() - t0:.2f}s")
+
+                out_base = os.path.splitext(os.path.basename(path))[0]
+                ext_map = {
+                    "png": ".png",
+                    "jpg": ".jpg",
+                    "webp": ".webp",
+                    "avif": ".avif",
+                }
+                out_ext = ext_map[cfg["OUTPUT_FORMAT"]]
+                out_path = os.path.join(
+                    cfg["OUTPUT_DIR"], f"{out_base}_{cfg['NOTE']}{out_ext}"
+                )
+
+                save_q.put((result_rgb, alpha, out_path))
+                progress.update(task_id, advance=1)
+                done += 1
+
+        save_q.put(None)
+        for w in writers:
+            w.join()
+        loader.join(timeout=1.0)
+
+    finally:
+        # Cleanup temp directory if we created one
+        if temp_dir is not None:
+            import shutil
+            try:
+                shutil.rmtree(temp_dir)
+                console.print(f"[dim]Cleaned up temp directory[/]")
+            except Exception as e:
+                console.print(f"[yellow]Warning: Failed to cleanup temp dir: {e}[/]")
 
     vram_stats = None
     if vram_monitor is not None and vram_monitor.enabled:
         vram_stats = vram_monitor.stop()
 
     total_runtime = time.perf_counter() - total_t0
-
     console.print("\n[bold]===== Summary =====[/]")
     console.print(f"Images processed : {total}")
     console.print(f"Total run time   : {format_hms(total_runtime)}")
