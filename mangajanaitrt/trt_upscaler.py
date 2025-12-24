@@ -1,10 +1,24 @@
 import os
 from pathlib import Path
 
+import cupy as cp
 import numpy as np
+import tensorrt as trt
 
+import onnx
 from mangajanaitrt.console import console, dbg
 from mangajanaitrt.tile_info import TileInfo
+
+
+def onnx_conv_info(onnx_path: str):
+    m = onnx.load(onnx_path)
+    info = {}
+    for n in m.graph.node:
+        if n.op_type != "Conv":
+            continue
+        attrs = {a.name: onnx.helper.get_attribute_value(a) for a in n.attribute}
+        info[n.name] = attrs
+    return info
 
 
 class TensorRTUpscaler:
@@ -14,6 +28,8 @@ class TensorRTUpscaler:
         batch_size: int = 1,
         use_fp16: bool = True,
         use_bf16: bool = False,
+        *,
+        use_strong_types: bool = False,
         device_id: int = 0,
         engine_cache_dir: str | None = None,
         # (width, height)
@@ -24,27 +40,11 @@ class TensorRTUpscaler:
         builder_opt_level: int = 3,
         trt_workspace_gb: int = 4,
     ) -> None:
-        try:
-            import tensorrt as trt
-        except ImportError:
-            raise ImportError(
-                "TensorRT not found. Install with:\n  pip install tensorrt\n"
-            )
-
-        try:
-            import cupy as cp
-        except ImportError:
-            raise ImportError(
-                "CuPy not found. Install with:\n  pip install cupy-cuda12x\n"
-            )
-
-        self.trt = trt
-        self.cp = cp
-
         self.onnx_path = onnx_path
         self.batch_size = batch_size
         self.use_fp16 = use_fp16
         self.use_bf16 = use_bf16
+        self.use_strong_types = use_strong_types
         self.device_id = device_id
         self.engine_cache_dir = engine_cache_dir or os.path.dirname(onnx_path)
 
@@ -76,6 +76,17 @@ class TensorRTUpscaler:
             else:
                 self.output_name = name
 
+        if self.input_name is None or self.output_name is None:
+            raise RuntimeError(
+                "Failed to identify input/output tensor names from engine"
+            )
+
+        self.input_trt_dtype = self.engine.get_tensor_dtype(self.input_name)
+        self.output_trt_dtype = self.engine.get_tensor_dtype(self.output_name)
+
+        self.input_cp_dtype = self._trt_dtype_to_cupy(self.input_trt_dtype)
+        self.output_cp_dtype = self._trt_dtype_to_cupy(self.output_trt_dtype)
+
         self.context = self.engine.create_execution_context()
 
         opt_w, opt_h = self.shape_opt
@@ -85,9 +96,7 @@ class TensorRTUpscaler:
                 f"Failed to set input shape {input_shape} for {self.input_name}"
             )
 
-        out_shape = self.context.get_tensor_shape(
-            self.output_name
-        )
+        out_shape = self.context.get_tensor_shape(self.output_name)
         if len(out_shape) != 4:
             raise RuntimeError(
                 f"Unexpected output shape {out_shape} for {self.output_name}"
@@ -122,6 +131,32 @@ class TensorRTUpscaler:
             f"  Shape range (WxH): {self.shape_min} -> {self.shape_opt} -> {self.shape_max}"
         )
         console.print(f"  Scale: {self.scale}x, Align: {self.tile_align}")
+        console.print(
+            f"  Strong types: {self.use_strong_types} | IO dtypes: {self.input_trt_dtype} -> {self.output_trt_dtype}"
+        )
+
+    def _trt_dtype_to_cupy(self, trt_dtype):
+        if trt_dtype == trt.DataType.FLOAT:
+            return cp.float32
+        if trt_dtype == trt.DataType.HALF:
+            return cp.float16
+        if hasattr(trt.DataType, "BF16") and trt_dtype == trt.DataType.BF16:
+            if not hasattr(cp, "bfloat16"):
+                raise RuntimeError(
+                    "Engine expects BF16, but your CuPy build has no cp.bfloat16. "
+                    "Install a CuPy build that supports BF16 on your platform."
+                )
+            return cp.bfloat16
+
+        raise RuntimeError(f"Unsupported TensorRT tensor dtype: {trt_dtype}")
+
+    def _maybe_set_builder_flag(self, config, *names: str) -> bool:
+        """Try multiple enum names for compatibility across TRT / TRT-RTX."""
+        for n in names:
+            if hasattr(trt.BuilderFlag, n):
+                config.set_flag(getattr(trt.BuilderFlag, n))
+                return True
+        return False
 
     def _validate_dynamic_shapes(self) -> None:
         min_w, min_h = self.shape_min
@@ -153,7 +188,13 @@ class TensorRTUpscaler:
 
     def _get_engine_path(self) -> str:
         onnx_name = Path(self.onnx_path).stem
-        precision = "bf16" if self.use_bf16 else ("fp16" if self.use_fp16 else "fp32")
+
+        if self.use_strong_types:
+            precision = f"strong_{self.engine_precision_tag()}"
+        else:
+            precision = (
+                "bf16" if self.use_bf16 else ("fp16" if self.use_fp16 else "fp32")
+            )
 
         min_w, min_h = self.shape_min
         opt_w, opt_h = self.shape_opt
@@ -171,13 +212,20 @@ class TensorRTUpscaler:
             f"{onnx_name}_{shape_str}_b{self.batch_size}_{precision}_{opt_str}.engine",
         )
 
+    def engine_precision_tag(self) -> str:
+        if self.use_bf16:
+            return "bf16"
+        if self.use_fp16:
+            return "fp16"
+        return "fp32"
+
     def _get_engine(self):
         engine_path = self._get_engine_path()
 
         if os.path.exists(engine_path):
             console.print(f"[cyan]Loading cached engine: {Path(engine_path).name}[/]")
             with open(engine_path, "rb") as f:
-                runtime = self.trt.Runtime(self.logger)
+                runtime = trt.Runtime(self.logger)
                 return runtime.deserialize_cuda_engine(f.read())
 
         console.print(
@@ -193,15 +241,18 @@ class TensorRTUpscaler:
         return engine
 
     def _build_engine(self):
-        trt = self.trt
-
         old_severity = self.logger.min_severity
         self.logger.min_severity = trt.Logger.INFO
         try:
             builder = trt.Builder(self.logger)
-            network = builder.create_network(
-                1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
-            )
+
+            flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+            if self.use_strong_types and hasattr(
+                trt.NetworkDefinitionCreationFlag, "STRONGLY_TYPED"
+            ):
+                flags |= 1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
+
+            network = builder.create_network(flags)
             parser = trt.OnnxParser(network, self.logger)
 
             with open(self.onnx_path, "rb") as f:
@@ -209,6 +260,48 @@ class TensorRTUpscaler:
                     for i in range(parser.num_errors):
                         console.print(f"[red]Parse Error: {parser.get_error(i)}[/]")
                     raise RuntimeError("Failed to parse ONNX model")
+
+            # self._dump_layer_index(network, trt, "dat.tsv")
+
+            # convs = sorted(self._indices_of_types(network, ["CONVOLUTION"]))
+            # print("convs:", len(convs))
+            #
+            # def conv_summary(i: int) -> None:
+            #     L = network.get_layer(i)
+            #     name = L.name or f"<unnamed:{i}>"
+            #
+            #     inp = L.get_input(0)
+            #     out = L.get_output(0)
+            #     in_shape = tuple(inp.shape) if inp is not None else None
+            #     out_shape = tuple(out.shape) if out is not None else None
+            #
+            #     k = getattr(L, "kernel_size_nd", None)
+            #     s = getattr(L, "stride_nd", None)
+            #     d = getattr(L, "dilation_nd", None)
+            #     g = getattr(L, "num_groups", None)
+            #     oc = getattr(L, "num_output_maps", None)
+            #
+            #     print(
+            #         f"{i:5d}  {name:40s}  in={in_shape} out={out_shape}  oc={oc} k={k} s={s} d={d} g={g}"
+            #     )
+            #
+            # layers = []
+            # for j, idx in enumerate(convs[:20], 1):
+            #     print(f"conv{j}: ", end="")
+            #     conv_summary(idx)
+            #     layers.append(network.get_layer(idx).name)
+
+            # conv_attrs = onnx_conv_info(self.onnx_path)
+
+            # for trt_name in layers:
+            #     print(trt_name, conv_attrs.get(trt_name))
+
+            # mid = len(convs) // 16
+            # bf16 = set(convs[:mid])  # first half
+            # s = 7
+            # bf16 = convs[s - 1 : s]  # first conv works
+            # print("bf16?", len(bf16))
+            # self._apply_bf16_mask(network, bf16)
 
             config = builder.create_builder_config()
 
@@ -225,12 +318,29 @@ class TensorRTUpscaler:
                     "[yellow]  Builder opt level not supported by this TRT version[/]"
                 )
 
-            if self.use_bf16 and builder.platform_has_fast_fp16:
-                config.set_flag(trt.BuilderFlag.BF16)
-                console.print("  Using BF16 precision")
+            if self.use_strong_types:
+                if self.use_bf16 or self.use_fp16:
+                    console.print(
+                        "[yellow]  Strong types enabled: ignoring FP16/BF16 builder flags; using ONNX-defined types[/]"
+                    )
+                else:
+                    console.print(
+                        "[yellow]  Strong types enabled: using ONNX-defined types (no precision flags)[/]"
+                    )
+            elif self.use_bf16 and builder.platform_has_fast_fp16:
+                if self._maybe_set_builder_flag(config, "BF16", "BF16Enable", "kBF16"):
+                    console.print("  Using BF16 precision")
+                else:
+                    console.print(
+                        "[yellow]  BF16 flag not available in this TRT build; falling back[/]"
+                    )
             elif self.use_fp16 and builder.platform_has_fast_fp16:
-                config.set_flag(trt.BuilderFlag.FP16)
-                console.print("  Using FP16 precision")
+                if self._maybe_set_builder_flag(config, "FP16", "FP16Enable", "kFP16"):
+                    console.print("  Using FP16 precision")
+                else:
+                    console.print(
+                        "[yellow]  FP16 flag not available in this TRT build; falling back[/]"
+                    )
             else:
                 console.print("  Using FP32 precision")
 
@@ -292,7 +402,6 @@ class TensorRTUpscaler:
         self._current_shape = (h, w)
 
     def upscale_image(self, img: np.ndarray, overlap: int = 16) -> np.ndarray:
-        cp = self.cp
         h, w = img.shape[:2]
         out_h, out_w = h * self.scale, w * self.scale
 
@@ -317,30 +426,28 @@ class TensorRTUpscaler:
             tile_info = tiles[0]
             infer_h, infer_w = tile_info.infer_h, tile_info.infer_w
 
-            tile_data = self._extract_tile(
-                img_float, tile_info
-            )
+            tile_data = self._extract_tile(img_float, tile_info)
 
             input_buf = cp.empty(
-                (self.batch_size, 3, infer_h, infer_w), dtype=cp.float32
+                (self.batch_size, 3, infer_h, infer_w), dtype=self.input_cp_dtype
             )
             buf_out_h = infer_h * self.scale
             buf_out_w = infer_w * self.scale
             output_buf = cp.empty(
-                (self.batch_size, 3, buf_out_h, buf_out_w), dtype=cp.float32
+                (self.batch_size, 3, buf_out_h, buf_out_w), dtype=self.output_cp_dtype
             )
 
             if self.is_dynamic:
                 self._set_input_shape(infer_h, infer_w)
 
-            input_buf[0] = cp.asarray(tile_data)
+            input_buf[0] = cp.asarray(tile_data, dtype=self.input_cp_dtype)
 
             self.context.set_tensor_address(self.input_name, input_buf.data.ptr)
             self.context.set_tensor_address(self.output_name, output_buf.data.ptr)
             self.context.execute_async_v3(self.stream.ptr)
             self.stream.synchronize()
 
-            result_chw = cp.asnumpy(output_buf[0])
+            result_chw = cp.asnumpy(output_buf[0]).astype(np.float32, copy=False)
             result = result_chw.transpose(1, 2, 0)
 
             if tile_info.pad_bottom > 0:
@@ -351,7 +458,6 @@ class TensorRTUpscaler:
             return np.clip(result * 255.0, 0, 255).astype(np.uint8)
 
         # multi tile
-
         output = np.zeros((out_h, out_w, 3), dtype=np.float32)
         weight_sum = np.zeros((out_h, out_w, 1), dtype=np.float32)
 
@@ -367,12 +473,13 @@ class TensorRTUpscaler:
 
             if shape_key not in input_buffer_cache:
                 input_buffer_cache[shape_key] = cp.empty(
-                    (self.batch_size, 3, infer_h, infer_w), dtype=cp.float32
+                    (self.batch_size, 3, infer_h, infer_w), dtype=self.input_cp_dtype
                 )
                 buf_out_h = infer_h * self.scale
                 buf_out_w = infer_w * self.scale
                 output_buffer_cache[shape_key] = cp.empty(
-                    (self.batch_size, 3, buf_out_h, buf_out_w), dtype=cp.float32
+                    (self.batch_size, 3, buf_out_h, buf_out_w),
+                    dtype=self.output_cp_dtype,
                 )
 
             input_buf = input_buffer_cache[shape_key]
@@ -381,14 +488,14 @@ class TensorRTUpscaler:
             if self.is_dynamic:
                 self._set_input_shape(infer_h, infer_w)
 
-            input_buf[0] = cp.asarray(tile_data)
+            input_buf[0] = cp.asarray(tile_data, dtype=self.input_cp_dtype)
 
             self.context.set_tensor_address(self.input_name, input_buf.data.ptr)
             self.context.set_tensor_address(self.output_name, output_buf.data.ptr)
             self.context.execute_async_v3(self.stream.ptr)
             self.stream.synchronize()
 
-            result = cp.asnumpy(output_buf[0])
+            result = cp.asnumpy(output_buf[0]).astype(np.float32, copy=False)
 
             self._accumulate_tile(result, tile_info, output, weight_sum, blend_masks)
 
@@ -432,6 +539,125 @@ class TensorRTUpscaler:
 
         output[y1:y2, x1:x2] += result * mask
         weight_sum[y1:y2, x1:x2] += mask
+
+    def _layer_types(self, trt, names: list[str]) -> set:
+        out = set()
+        for n in names:
+            if hasattr(trt.LayerType, n):
+                out.add(getattr(trt.LayerType, n))
+        return out
+
+    def _collect_candidate_indices(self, network, trt) -> list[int]:
+        cand_types = set()
+        for name in [
+            "MATRIX_MULTIPLY",
+            "EINSUM",
+            "SOFTMAX",
+            "RAGGED_SOFTMAX",
+            "NORMALIZATION",
+            "REDUCE",
+            "CONVOLUTION",
+            "PLUGIN",
+            "PLUGIN_V2",
+            "PLUGIN_V3",
+        ]:
+            if hasattr(trt.LayerType, name):
+                cand_types.add(getattr(trt.LayerType, name))
+
+        idx = []
+        for i in range(network.num_layers):
+            if network.get_layer(i).type in cand_types:
+                idx.append(i)
+        return idx
+
+    def _dump_layer_index(self, network, trt, out_path: str) -> None:
+        interesting = self._layer_types(
+            trt,
+            [
+                "MATRIX_MULTIPLY",
+                "EINSUM",
+                "SOFTMAX",
+                "RAGGED_SOFTMAX",
+                "NORMALIZATION",
+                "REDUCE",
+                "CONVOLUTION",
+                "PLUGIN",
+                "PLUGIN_V2",
+                "PLUGIN_V3",
+                "SCALE",
+            ],
+        )
+        lines = ["idx\ttype\tname\tout0_dtype\tout0_shape"]
+        for i in range(network.num_layers):
+            L = network.get_layer(i)
+            if L.type not in interesting:
+                continue
+            name = L.name if L.name else f"<unnamed:{i}>"
+            out0_dtype = ""
+            out0_shape = ""
+            if L.num_outputs:
+                t0 = L.get_output(0)
+                if t0 is not None:
+                    out0_dtype = str(t0.dtype)
+                    out0_shape = str(tuple(t0.shape))
+            lines.append(f"{i}\t{L.type}\t{name}\t{out0_dtype}\t{out0_shape}")
+
+        Path(out_path).write_text("\n".join(lines), encoding="utf-8")
+        console.print(f"[cyan]Wrote filtered layer index: {out_path}[/]")
+
+    def _apply_bf16_mask(self, network, bf16_layer_indices: set[int]) -> None:
+        BF16 = getattr(trt.DataType, "BF16", None)
+        if BF16 is None:
+            raise RuntimeError("No DataType.BF16 in this TRT build")
+
+        float_layer_types = set()
+        for n in [
+            "CONVOLUTION",
+            "MATRIX_MULTIPLY",
+            "EINSUM",
+            "SOFTMAX",
+            "RAGGED_SOFTMAX",
+            "NORMALIZATION",
+            "REDUCE",
+            "SCALE",
+            "PLUGIN",
+            "PLUGIN_V2",
+            "PLUGIN_V3",
+        ]:
+            if hasattr(trt.LayerType, n):
+                float_layer_types.add(getattr(trt.LayerType, n))
+
+        def set_prec(layer, dtype) -> None:
+            layer.precision = dtype
+            for oi in range(layer.num_outputs):
+                out = layer.get_output(oi)
+                if out is None:
+                    continue
+
+                if out.dtype in (trt.DataType.FLOAT, trt.DataType.HALF, BF16):
+                    layer.set_output_type(oi, dtype)
+
+        for i in range(network.num_layers):
+            L = network.get_layer(i)
+            if L.type not in float_layer_types:
+                continue
+
+            if i in bf16_layer_indices:
+                print("set_prec", i, L.name)
+                set_prec(L, BF16)
+            else:
+                set_prec(L, trt.DataType.FLOAT)
+
+    def _indices_of_types(self, network, type_names: list[str]) -> set[int]:
+        types = set()
+        for n in type_names:
+            if hasattr(trt.LayerType, n):
+                types.add(getattr(trt.LayerType, n))
+        out = set()
+        for i in range(network.num_layers):
+            if network.get_layer(i).type in types:
+                out.add(i)
+        return out
 
 
 def create_blend_mask(h: int, w: int, tile_info: TileInfo) -> np.ndarray:

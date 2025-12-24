@@ -1,11 +1,13 @@
 import os
+import re
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 import pyvips
-import re
 import requests
-from urllib.parse import urlparse, unquote
+
 from mangajanaitrt.console import console
+
 
 def is_url(path: str) -> bool:
     return path.startswith(("http://", "https://"))
@@ -100,7 +102,6 @@ def download_image_to_temp(url: str, temp_dir: str) -> str:
 
 
 def load_image(path: str) -> tuple[np.ndarray, np.ndarray | None]:
-
     img_peek = pyvips.Image.new_from_file(path, access="sequential")
     needs_alpha = img_peek.bands in (2, 4)
 

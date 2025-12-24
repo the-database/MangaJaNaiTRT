@@ -22,7 +22,7 @@ from rich.progress import (
 )
 
 from mangajanaitrt.console import console, dbg
-from mangajanaitrt.img import load_image, save_image, is_url, download_image_to_temp
+from mangajanaitrt.img import download_image_to_temp, is_url, load_image, save_image
 from mangajanaitrt.trt_upscaler import TensorRTUpscaler
 from mangajanaitrt.vram_monitor import VRAMMonitor
 
@@ -62,6 +62,7 @@ def load_config(config_path: str | Path = "config.ini"):
     # [trt]
     use_fp16 = cfg.getboolean("trt", "use_fp16", fallback=False)
     use_bf16 = cfg.getboolean("trt", "use_bf16", fallback=True)
+    use_strong_types = cfg.getboolean("trt", "use_strong_types", fallback=False)
     batch_size = cfg.getint("trt", "batch_size", fallback=1)
     device_id = cfg.getint("trt", "device_id", fallback=0)
     trt_workspace_gb = cfg.getint("trt", "workspace_gb", fallback=4)
@@ -105,6 +106,7 @@ def load_config(config_path: str | Path = "config.ini"):
         "TILE_OVERLAP": tile_overlap,
         "USE_FP16": use_fp16,
         "USE_BF16": use_bf16,
+        "USE_STRONG_TYPES": use_strong_types,
         "BATCH_SIZE": batch_size,
         "DEVICE_ID": device_id,
         "TRT_WORKSPACE_GB": trt_workspace_gb,
@@ -179,10 +181,10 @@ def upscale_alpha(alpha: np.ndarray, scale: int) -> np.ndarray:
 
 
 def image_writer_thread(
-        q: "Queue[tuple[np.ndarray, np.ndarray | None, str] | None]",
-        quality: int,
-        webp_lossless: bool,
-        scale: int,
+    q: "Queue[tuple[np.ndarray, np.ndarray | None, str] | None]",
+    quality: int,
+    webp_lossless: bool,
+    scale: int,
 ) -> None:
     while True:
         item = q.get()
@@ -199,8 +201,8 @@ def image_writer_thread(
 
 
 def image_loader_thread(
-        files: list[str],
-        job_q: "Queue[tuple[str, np.ndarray, np.ndarray | None] | None]",
+    files: list[str],
+    job_q: "Queue[tuple[str, np.ndarray, np.ndarray | None] | None]",
 ) -> None:
     for path in files:
         try:
@@ -211,7 +213,9 @@ def image_loader_thread(
     job_q.put(None)
 
 
-def collect_input_files(input_path: str, exts: set[str], temp_dir: str | None = None) -> list[str]:
+def collect_input_files(
+    input_path: str, exts: set[str], temp_dir: str | None = None
+) -> list[str]:
     """
     Collect input files from a path, which can be:
     - A local file path
@@ -287,6 +291,7 @@ def main() -> None:
             tile_align=cfg["TILE_ALIGN"],
             builder_opt_level=cfg["TRT_OPT_LEVEL"],
             trt_workspace_gb=cfg["TRT_WORKSPACE_GB"],
+            use_strong_types=cfg["USE_STRONG_TYPES"],
         )
 
         num_savers = cfg["NUM_SAVE_THREADS"]
@@ -325,7 +330,9 @@ def main() -> None:
                 if item is None:
                     break
                 path, rgb, alpha = item
-                progress.update(task_id, filename=filename_for_bar(os.path.basename(path)))
+                progress.update(
+                    task_id, filename=filename_for_bar(os.path.basename(path))
+                )
 
                 t0 = time.perf_counter()
                 result_rgb = upscaler.upscale_image(rgb, overlap=cfg["TILE_OVERLAP"])
@@ -363,9 +370,10 @@ def main() -> None:
         # Cleanup temp directory if we created one
         if temp_dir is not None:
             import shutil
+
             try:
                 shutil.rmtree(temp_dir)
-                console.print(f"[dim]Cleaned up temp directory[/]")
+                console.print("[dim]Cleaned up temp directory[/]")
             except Exception as e:
                 console.print(f"[yellow]Warning: Failed to cleanup temp dir: {e}[/]")
 
