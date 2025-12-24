@@ -190,7 +190,7 @@ class TensorRTUpscaler:
         onnx_name = Path(self.onnx_path).stem
 
         if self.use_strong_types:
-            precision = f"strong_{self.engine_precision_tag()}"
+            precision = f"strong"
         else:
             precision = (
                 "bf16" if self.use_bf16 else ("fp16" if self.use_fp16 else "fp32")
