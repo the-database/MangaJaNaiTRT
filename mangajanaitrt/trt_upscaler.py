@@ -261,48 +261,6 @@ class TensorRTUpscaler:
                         console.print(f"[red]Parse Error: {parser.get_error(i)}[/]")
                     raise RuntimeError("Failed to parse ONNX model")
 
-            # self._dump_layer_index(network, trt, "dat.tsv")
-
-            # convs = sorted(self._indices_of_types(network, ["CONVOLUTION"]))
-            # print("convs:", len(convs))
-            #
-            # def conv_summary(i: int) -> None:
-            #     L = network.get_layer(i)
-            #     name = L.name or f"<unnamed:{i}>"
-            #
-            #     inp = L.get_input(0)
-            #     out = L.get_output(0)
-            #     in_shape = tuple(inp.shape) if inp is not None else None
-            #     out_shape = tuple(out.shape) if out is not None else None
-            #
-            #     k = getattr(L, "kernel_size_nd", None)
-            #     s = getattr(L, "stride_nd", None)
-            #     d = getattr(L, "dilation_nd", None)
-            #     g = getattr(L, "num_groups", None)
-            #     oc = getattr(L, "num_output_maps", None)
-            #
-            #     print(
-            #         f"{i:5d}  {name:40s}  in={in_shape} out={out_shape}  oc={oc} k={k} s={s} d={d} g={g}"
-            #     )
-            #
-            # layers = []
-            # for j, idx in enumerate(convs[:20], 1):
-            #     print(f"conv{j}: ", end="")
-            #     conv_summary(idx)
-            #     layers.append(network.get_layer(idx).name)
-
-            # conv_attrs = onnx_conv_info(self.onnx_path)
-
-            # for trt_name in layers:
-            #     print(trt_name, conv_attrs.get(trt_name))
-
-            # mid = len(convs) // 16
-            # bf16 = set(convs[:mid])  # first half
-            # s = 7
-            # bf16 = convs[s - 1 : s]  # first conv works
-            # print("bf16?", len(bf16))
-            # self._apply_bf16_mask(network, bf16)
-
             config = builder.create_builder_config()
 
             config.set_memory_pool_limit(
