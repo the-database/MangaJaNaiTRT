@@ -6,7 +6,7 @@ import time
 import warnings
 from configparser import ConfigParser
 from pathlib import Path
-from queue import Queue, Empty
+from queue import Queue
 
 warnings.filterwarnings("ignore", message="CUDA path could not be detected")
 
@@ -22,16 +22,9 @@ from rich.progress import (
 )
 
 from mangajanaitrt.console import console, dbg
-from mangajanaitrt.img import (
-    is_url,
-    load_image,
-    save_image,
-    get_output_path,
-    filter_existing_outputs,
-    collect_input_files,
-)
+from mangajanaitrt.img import is_url, load_image, save_image, get_output_path, filter_existing_outputs, collect_input_files
 from mangajanaitrt.trt_upscaler import TensorRTUpscaler
-from mangajanaitrt.vram_monitor import MultiGPUVRAMMonitor
+from mangajanaitrt.vram_monitor import VRAMMonitor
 
 
 def parse_hw_tuple(s: str) -> tuple[int, int]:
@@ -39,12 +32,6 @@ def parse_hw_tuple(s: str) -> tuple[int, int]:
     if len(parts) != 2:
         raise ValueError(f"Invalid H,W tuple: {s!r}")
     return int(parts[0]), int(parts[1])
-
-
-def parse_device_ids(s: str) -> list[int]:
-    """Parse comma-separated device IDs like '0,1,2,3' or just '0'."""
-    parts = [p.strip() for p in s.split(",")]
-    return [int(p) for p in parts if p]
 
 
 def load_config(config_path: str | Path = "config.ini"):
@@ -77,12 +64,9 @@ def load_config(config_path: str | Path = "config.ini"):
     use_bf16 = cfg.getboolean("trt", "use_bf16", fallback=True)
     use_strong_types = cfg.getboolean("trt", "use_strong_types", fallback=False)
     batch_size = cfg.getint("trt", "batch_size", fallback=1)
+    device_id = cfg.getint("trt", "device_id", fallback=0)
     trt_workspace_gb = cfg.getint("trt", "workspace_gb", fallback=4)
     trt_opt_level = cfg.getint("trt", "opt_level", fallback=3)
-
-    # Multi-GPU: parse device_ids as comma-separated list
-    device_ids_raw = cfg.get("trt", "device_id", fallback="0")
-    device_ids = parse_device_ids(device_ids_raw)
 
     # [runtime]
     prefetch_images = cfg.getint("runtime", "prefetch_images", fallback=1)
@@ -126,7 +110,7 @@ def load_config(config_path: str | Path = "config.ini"):
         "USE_BF16": use_bf16,
         "USE_STRONG_TYPES": use_strong_types,
         "BATCH_SIZE": batch_size,
-        "DEVICE_IDS": device_ids,
+        "DEVICE_ID": device_id,
         "TRT_WORKSPACE_GB": trt_workspace_gb,
         "TRT_OPT_LEVEL": trt_opt_level,
         "NOTE": note,
@@ -142,7 +126,7 @@ def load_config(config_path: str | Path = "config.ini"):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Multi-GPU TensorRT upscaler with INI config."
+        description="TensorRT upscaler front-end with INI config."
     )
     parser.add_argument(
         "-c",
@@ -182,7 +166,7 @@ def make_progress() -> Progress:
         TimeElapsedColumn(),
         TextColumn(" ETA:"),
         TimeRemainingColumn(),
-        TextColumn(" • {task.fields[status]}"),
+        TextColumn(" • {task.fields[filename]}"),
         console=console,
         refresh_per_second=5,
         transient=False,
@@ -192,6 +176,7 @@ def make_progress() -> Progress:
 def upscale_alpha(alpha: np.ndarray, scale: int) -> np.ndarray:
     h, w = alpha.shape
     img = pyvips.Image.new_from_memory(alpha.tobytes(), w, h, 1, "uchar")
+    # Use bicubic (cubic) interpolation for smooth alpha edges
     img = img.resize(scale, kernel="cubic")
     return np.ndarray(
         buffer=img.write_to_memory(), dtype=np.uint8, shape=[img.height, img.width]
@@ -199,18 +184,17 @@ def upscale_alpha(alpha: np.ndarray, scale: int) -> np.ndarray:
 
 
 def image_writer_thread(
-    save_queue: "Queue[tuple[np.ndarray, np.ndarray | None, str, int] | None]",
-    quality: int,
-    webp_lossless: bool,
-    scale: int,
+        q: "Queue[tuple[np.ndarray, np.ndarray | None, str] | None]",
+        quality: int,
+        webp_lossless: bool,
+        scale: int,
 ) -> None:
-    """Writer thread that saves completed images to disk."""
     while True:
-        item = save_queue.get()
+        item = q.get()
         if item is None:
-            save_queue.put(None)  # propagate sentinel
+            q.put(None)
             break
-        rgb, alpha, out_path, _scale = item
+        rgb, alpha, out_path = item
         if alpha is not None:
             result_alpha = upscale_alpha(alpha, scale)
             out_arr = np.dstack([rgb, result_alpha])
@@ -220,127 +204,16 @@ def image_writer_thread(
 
 
 def image_loader_thread(
-    files: list[str],
-    job_queue: "Queue[tuple[str, np.ndarray, np.ndarray | None] | None]",
-    num_gpus: int,
+        files: list[str],
+        job_q: "Queue[tuple[str, np.ndarray, np.ndarray | None] | None]",
 ) -> None:
-    """Loader thread that reads images and feeds them to the job queue."""
     for path in files:
         try:
             rgb, alpha = load_image(path)
-            job_queue.put((path, rgb, alpha))
+            job_q.put((path, rgb, alpha))
         except Exception as e:
             console.print(f"[red]Failed to load {path}: {e}[/]")
-
-    # Send sentinel for each GPU worker
-    for _ in range(num_gpus):
-        job_queue.put(None)
-
-
-def gpu_worker_thread(
-    device_id: int,
-    job_queue: "Queue[tuple[str, np.ndarray, np.ndarray | None] | None]",
-    result_queue: "Queue[tuple[str, np.ndarray, np.ndarray | None, int] | None]",
-    cfg: dict,
-    ready_event: threading.Event,
-    init_error: list,
-) -> None:
-    """
-    GPU worker thread. Each thread:
-    1. Initializes its own TensorRT engine on the assigned GPU
-    2. Pulls images from the shared job queue
-    3. Pushes results to the result queue
-    """
-    try:
-        upscaler = TensorRTUpscaler(
-            onnx_path=cfg["INPUT_ONNX"],
-            batch_size=cfg["BATCH_SIZE"],
-            use_fp16=cfg["USE_FP16"],
-            use_bf16=cfg["USE_BF16"],
-            device_id=device_id,
-            engine_cache_dir=cfg["ENGINE_CACHE_DIR"],
-            shape_min=cfg["DYNAMIC_SHAPE_MIN"],
-            shape_opt=cfg["DYNAMIC_SHAPE_OPT"],
-            shape_max=cfg["DYNAMIC_SHAPE_MAX"],
-            tile_align=cfg["TILE_ALIGN"],
-            builder_opt_level=cfg["TRT_OPT_LEVEL"],
-            trt_workspace_gb=cfg["TRT_WORKSPACE_GB"],
-            use_strong_types=cfg["USE_STRONG_TYPES"],
-        )
-        scale = upscaler.scale
-        ready_event.set()
-    except Exception as e:
-        init_error.append((device_id, e))
-        ready_event.set()
-        return
-
-    overlap = cfg["TILE_OVERLAP"]
-
-    while True:
-        try:
-            item = job_queue.get(timeout=0.5)
-        except Empty:
-            continue
-
-        if item is None:
-            break
-
-        path, rgb, alpha = item
-
-        try:
-            t0 = time.perf_counter()
-            result_rgb = upscaler.upscale_image(rgb, overlap=overlap)
-            dbg(f"[GPU {device_id}] {os.path.basename(path)}: {time.perf_counter() - t0:.2f}s")
-
-            result_queue.put((path, result_rgb, alpha, scale))
-        except Exception as e:
-            console.print(f"[red][GPU {device_id}] Failed to upscale {path}: {e}[/]")
-
-
-def result_collector_thread(
-    result_queue: "Queue[tuple[str, np.ndarray, np.ndarray | None, int] | None]",
-    save_queue: "Queue[tuple[np.ndarray, np.ndarray | None, str, int] | None]",
-    cfg: dict,
-    progress: Progress,
-    task_id,
-    total: int,
-    num_gpus: int,
-    done_counter: list,
-) -> None:
-    """
-    Collector thread that:
-    1. Receives results from GPU workers
-    2. Updates progress bar
-    3. Forwards to save queue
-    """
-    done = 0
-    active_gpus = num_gpus
-
-    while done < total and active_gpus > 0:
-        try:
-            item = result_queue.get(timeout=0.5)
-        except Empty:
-            continue
-
-        if item is None:
-            active_gpus -= 1
-            continue
-
-        path, result_rgb, alpha, scale = item
-
-        out_path = get_output_path(
-            path, cfg["OUTPUT_DIR"], cfg["NOTE"], cfg["OUTPUT_FORMAT"]
-        )
-
-        save_queue.put((result_rgb, alpha, out_path, scale))
-
-        done += 1
-        done_counter[0] = done
-        progress.update(
-            task_id,
-            advance=1,
-            status=f"GPU×{num_gpus} | {filename_for_bar(os.path.basename(path), 20)}",
-        )
+    job_q.put(None)
 
 
 def main() -> None:
@@ -348,13 +221,7 @@ def main() -> None:
     total_t0 = time.perf_counter()
 
     cfg = load_config(args.config)
-    device_ids = cfg["DEVICE_IDS"]
-    num_gpus = len(device_ids)
-
-    console.print(f"[bold cyan]Multi-GPU mode: {num_gpus} GPU(s) - devices {device_ids}[/]")
-
-    # Initialize multi-GPU VRAM monitor
-    vram_monitor = MultiGPUVRAMMonitor(device_ids=device_ids)
+    vram_monitor = VRAMMonitor(device_id=cfg["DEVICE_ID"])
     vram_monitor.start()
 
     if not os.path.isfile(cfg["INPUT_ONNX"]):
@@ -362,6 +229,7 @@ def main() -> None:
 
     exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".avif"}
 
+    # Create temp directory for URL downloads if needed
     temp_dir = None
     input_is_url = is_url(cfg["INPUT_PATH"])
 
@@ -379,6 +247,7 @@ def main() -> None:
         total_found = len(files)
         console.print(f"[bold]Found {total_found} image(s)[/]")
 
+        # Filter out files with existing outputs if skip_existing is enabled
         skipped_count = 0
         if cfg["SKIP_EXISTING"]:
             files, skipped_count = filter_existing_outputs(
@@ -393,145 +262,89 @@ def main() -> None:
                 vram_monitor.stop()
                 return
 
-        total = len(files)
-
-        # === Initialize GPU workers ===
-        console.print(f"\n[bold]Initializing TensorRT on {num_gpus} GPU(s)...[/]")
-
-        # Shared queues
-        # Job queue: loader -> GPU workers (prefetch per GPU for good saturation)
-        job_queue: Queue[tuple[str, np.ndarray, np.ndarray | None] | None] = Queue(
-            maxsize=cfg["PREFETCH_IMAGES"] * num_gpus
+        console.print("\n[bold]Initializing TensorRT...[/]")
+        upscaler = TensorRTUpscaler(
+            onnx_path=cfg["INPUT_ONNX"],
+            batch_size=cfg["BATCH_SIZE"],
+            use_fp16=cfg["USE_FP16"],
+            use_bf16=cfg["USE_BF16"],
+            device_id=cfg["DEVICE_ID"],
+            engine_cache_dir=cfg["ENGINE_CACHE_DIR"],
+            shape_min=cfg["DYNAMIC_SHAPE_MIN"],
+            shape_opt=cfg["DYNAMIC_SHAPE_OPT"],
+            shape_max=cfg["DYNAMIC_SHAPE_MAX"],
+            tile_align=cfg["TILE_ALIGN"],
+            builder_opt_level=cfg["TRT_OPT_LEVEL"],
+            trt_workspace_gb=cfg["TRT_WORKSPACE_GB"],
+            use_strong_types=cfg["USE_STRONG_TYPES"],
         )
-        # Result queue: GPU workers -> collector
-        result_queue: Queue[tuple[str, np.ndarray, np.ndarray | None, int] | None] = Queue(
-            maxsize=num_gpus * 2
-        )
-        # Save queue: collector -> writers
-        save_queue: Queue[tuple[np.ndarray, np.ndarray | None, str, int] | None] = Queue(
+
+        num_savers = cfg["NUM_SAVE_THREADS"]
+        save_q: Queue[tuple[np.ndarray, np.ndarray | None, str] | None] = Queue(
             maxsize=cfg["SAVE_QUEUE_MAXSIZE"]
         )
-
-        # Start GPU workers
-        gpu_workers = []
-        ready_events = []
-        init_errors: list[tuple[int, Exception]] = []
-
-        for dev_id in device_ids:
-            ready = threading.Event()
-            ready_events.append(ready)
-            worker = threading.Thread(
-                target=gpu_worker_thread,
-                args=(dev_id, job_queue, result_queue, cfg, ready, init_errors),
-                daemon=True,
-            )
-            worker.start()
-            gpu_workers.append(worker)
-
-        # Wait for all GPUs to initialize
-        for i, ready in enumerate(ready_events):
-            ready.wait()
-            if not init_errors:
-                console.print(f"  [green]GPU {device_ids[i]} ready[/]")
-
-        if init_errors:
-            for dev_id, err in init_errors:
-                console.print(f"[red]GPU {dev_id} init failed: {err}[/]")
-            raise RuntimeError("One or more GPUs failed to initialize")
-
-        # Get scale from first worker (they're all identical)
-        # We need to query it - for now assume scale is determined, use a workaround
-        # by checking the engine. We'll pass scale through result queue items.
-
-        # Start image loader
-        loader = threading.Thread(
-            target=image_loader_thread,
-            args=(files, job_queue, num_gpus),
-            daemon=True,
-        )
-        loader.start()
-
-        # Start save threads (scale them with GPU count)
-        num_savers = max(cfg["NUM_SAVE_THREADS"], num_gpus)
         writers = []
-
-        # We need the scale - peek it from first result or use a placeholder
-        # Actually, we pass scale in each result item, so writers get it per-image
-        # But upscale_alpha needs scale. Let's create a modified writer that uses per-item scale.
-
-        # For simplicity, we'll determine scale after first GPU initializes
-        # The scale is in the result tuple, so writers use it from there.
-
-        # Modified writer that accepts scale per item:
-        def image_writer_thread_v2(
-            sq: "Queue[tuple[np.ndarray, np.ndarray | None, str, int] | None]",
-            quality: int,
-            webp_lossless: bool,
-        ) -> None:
-            while True:
-                item = sq.get()
-                if item is None:
-                    sq.put(None)
-                    break
-                rgb, alpha, out_path, scale = item
-                if alpha is not None:
-                    result_alpha = upscale_alpha(alpha, scale)
-                    out_arr = np.dstack([rgb, result_alpha])
-                else:
-                    out_arr = rgb
-                save_image(out_arr, out_path, quality=quality, webp_lossless=webp_lossless)
-
         for _ in range(num_savers):
             w = threading.Thread(
-                target=image_writer_thread_v2,
-                args=(save_queue, cfg["QUALITY"], cfg["WEBP_LOSSLESS"]),
+                target=image_writer_thread,
+                args=(save_q, cfg["QUALITY"], cfg["WEBP_LOSSLESS"], upscaler.scale),
                 daemon=True,
             )
             w.start()
             writers.append(w)
 
-        # Progress and collection
-        progress = make_progress()
-        done_counter = [0]
+        job_q: Queue[tuple[str, np.ndarray, np.ndarray | None] | None] = Queue(
+            maxsize=cfg["PREFETCH_IMAGES"]
+        )
+        loader = threading.Thread(
+            target=image_loader_thread, args=(files, job_q), daemon=True
+        )
+        loader.start()
 
+        total = len(files)
+        progress = make_progress()
         console.print(
-            f"\n[bold]Processing {total} images with {num_gpus} GPU(s) and {num_savers} saver thread(s)...[/]\n"
+            f"\n[bold]Processing {total} images with {num_savers} saver thread(s)...[/]\n"
         )
 
         with progress:
-            task_id = progress.add_task("upscaling", total=total, status="starting...")
+            task_id = progress.add_task("upscaling", total=total, filename="")
+            done = 0
+            while done < total:
+                item = job_q.get()
+                if item is None:
+                    break
+                path, rgb, alpha = item
+                progress.update(
+                    task_id, filename=filename_for_bar(os.path.basename(path))
+                )
 
-            collector = threading.Thread(
-                target=result_collector_thread,
-                args=(
-                    result_queue,
-                    save_queue,
-                    cfg,
-                    progress,
-                    task_id,
-                    total,
-                    num_gpus,
-                    done_counter,
-                ),
-                daemon=True,
-            )
-            collector.start()
+                t0 = time.perf_counter()
+                result_rgb = upscaler.upscale_image(rgb, overlap=cfg["TILE_OVERLAP"])
 
-            # Wait for collection to complete
-            collector.join()
+                if alpha is not None:
+                    result_alpha = upscale_alpha(alpha, upscaler.scale)
+                    result = np.dstack([result_rgb, result_alpha])
+                else:
+                    result = result_rgb
 
-        # Signal writers to stop
-        save_queue.put(None)
+                dbg(f"{os.path.basename(path)}: {time.perf_counter() - t0:.2f}s")
+
+                out_path = get_output_path(
+                    path, cfg["OUTPUT_DIR"], cfg["NOTE"], cfg["OUTPUT_FORMAT"]
+                )
+
+                save_q.put((result_rgb, alpha, out_path))
+                progress.update(task_id, advance=1)
+                done += 1
+
+        save_q.put(None)
         for w in writers:
             w.join()
-
-        # Wait for GPU workers (they should have exited after getting None sentinels)
-        for worker in gpu_workers:
-            worker.join(timeout=2.0)
-
         loader.join(timeout=1.0)
 
     finally:
+        # Cleanup temp directory if we created one
         if temp_dir is not None:
             import shutil
 
@@ -547,7 +360,6 @@ def main() -> None:
 
     total_runtime = time.perf_counter() - total_t0
     console.print("\n[bold]===== Summary =====[/]")
-    console.print(f"GPUs used        : {num_gpus} ({device_ids})")
     console.print(f"Images processed : {total}")
     if skipped_count > 0:
         console.print(f"Images skipped   : {skipped_count}")
@@ -559,13 +371,9 @@ def main() -> None:
         )
 
     if vram_stats:
-        console.print("\n[bold]VRAM Usage per GPU:[/]")
-        for dev_id, stats in vram_stats.items():
-            console.print(
-                f"  GPU {dev_id}: baseline {stats['base_used_gib']:.2f} GiB, "
-                f"peak {stats['peak_abs_gib']:.2f} GiB, "
-                f"delta {stats['peak_delta_gib']:.2f} GiB"
-            )
+        console.print(f"VRAM baseline    : {vram_stats['base_used_gib']:.2f} GiB")
+        console.print(f"VRAM peak (abs)  : {vram_stats['peak_abs_gib']:.2f} GiB")
+        console.print(f"VRAM peak (delta): {vram_stats['peak_delta_gib']:.2f} GiB")
 
 
 if __name__ == "__main__":
