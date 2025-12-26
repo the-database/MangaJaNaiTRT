@@ -244,6 +244,7 @@ def gpu_worker_thread(
     cfg: dict,
     ready_event: threading.Event,
     init_error: list,
+    engine_build_lock: threading.Lock,
 ) -> None:
     """
     GPU worker thread. Each thread:
@@ -252,21 +253,24 @@ def gpu_worker_thread(
     3. Pushes results to the result queue
     """
     try:
-        upscaler = TensorRTUpscaler(
-            onnx_path=cfg["INPUT_ONNX"],
-            batch_size=cfg["BATCH_SIZE"],
-            use_fp16=cfg["USE_FP16"],
-            use_bf16=cfg["USE_BF16"],
-            device_id=device_id,
-            engine_cache_dir=cfg["ENGINE_CACHE_DIR"],
-            shape_min=cfg["DYNAMIC_SHAPE_MIN"],
-            shape_opt=cfg["DYNAMIC_SHAPE_OPT"],
-            shape_max=cfg["DYNAMIC_SHAPE_MAX"],
-            tile_align=cfg["TILE_ALIGN"],
-            builder_opt_level=cfg["TRT_OPT_LEVEL"],
-            trt_workspace_gb=cfg["TRT_WORKSPACE_GB"],
-            use_strong_types=cfg["USE_STRONG_TYPES"],
-        )
+        # TensorRT builder is not thread-safe - serialize engine builds
+        with engine_build_lock:
+            console.print(f"  [dim]GPU {device_id}: initializing...[/]")
+            upscaler = TensorRTUpscaler(
+                onnx_path=cfg["INPUT_ONNX"],
+                batch_size=cfg["BATCH_SIZE"],
+                use_fp16=cfg["USE_FP16"],
+                use_bf16=cfg["USE_BF16"],
+                device_id=device_id,
+                engine_cache_dir=cfg["ENGINE_CACHE_DIR"],
+                shape_min=cfg["DYNAMIC_SHAPE_MIN"],
+                shape_opt=cfg["DYNAMIC_SHAPE_OPT"],
+                shape_max=cfg["DYNAMIC_SHAPE_MAX"],
+                tile_align=cfg["TILE_ALIGN"],
+                builder_opt_level=cfg["TRT_OPT_LEVEL"],
+                trt_workspace_gb=cfg["TRT_WORKSPACE_GB"],
+                use_strong_types=cfg["USE_STRONG_TYPES"],
+            )
         scale = upscaler.scale
         ready_event.set()
     except Exception as e:
@@ -412,6 +416,9 @@ def main() -> None:
             maxsize=cfg["SAVE_QUEUE_MAXSIZE"]
         )
 
+        # TensorRT builder is not thread-safe, so serialize engine builds
+        engine_build_lock = threading.Lock()
+
         # Start GPU workers
         gpu_workers = []
         ready_events = []
@@ -422,7 +429,7 @@ def main() -> None:
             ready_events.append(ready)
             worker = threading.Thread(
                 target=gpu_worker_thread,
-                args=(dev_id, job_queue, result_queue, cfg, ready, init_errors),
+                args=(dev_id, job_queue, result_queue, cfg, ready, init_errors, engine_build_lock),
                 daemon=True,
             )
             worker.start()
