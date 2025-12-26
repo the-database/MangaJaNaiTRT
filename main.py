@@ -22,7 +22,7 @@ from rich.progress import (
 )
 
 from mangajanaitrt.console import console, dbg
-from mangajanaitrt.img import download_image_to_temp, is_url, load_image, save_image
+from mangajanaitrt.img import is_url, load_image, save_image, get_output_path, filter_existing_outputs, collect_input_files
 from mangajanaitrt.trt_upscaler import TensorRTUpscaler
 from mangajanaitrt.vram_monitor import VRAMMonitor
 
@@ -79,11 +79,13 @@ def load_config(config_path: str | Path = "config.ini"):
         note = cfg.get("output", "note", fallback="mangajanai")
         quality = cfg.getint("output", "quality", fallback=95)
         webp_lossless = cfg.getboolean("output", "webp_lossless", fallback=False)
+        skip_existing = cfg.getboolean("output", "skip_existing", fallback=False)
     else:
         output_format = "png"
         note = "mangajanai"
         quality = 95
         webp_lossless = False
+        skip_existing = False
 
     if output_format == "jpeg":
         output_format = "jpg"
@@ -118,6 +120,7 @@ def load_config(config_path: str | Path = "config.ini"):
         "OUTPUT_FORMAT": output_format,
         "QUALITY": quality,
         "WEBP_LOSSLESS": webp_lossless,
+        "SKIP_EXISTING": skip_existing,
     }
 
 
@@ -181,10 +184,10 @@ def upscale_alpha(alpha: np.ndarray, scale: int) -> np.ndarray:
 
 
 def image_writer_thread(
-    q: "Queue[tuple[np.ndarray, np.ndarray | None, str] | None]",
-    quality: int,
-    webp_lossless: bool,
-    scale: int,
+        q: "Queue[tuple[np.ndarray, np.ndarray | None, str] | None]",
+        quality: int,
+        webp_lossless: bool,
+        scale: int,
 ) -> None:
     while True:
         item = q.get()
@@ -201,8 +204,8 @@ def image_writer_thread(
 
 
 def image_loader_thread(
-    files: list[str],
-    job_q: "Queue[tuple[str, np.ndarray, np.ndarray | None] | None]",
+        files: list[str],
+        job_q: "Queue[tuple[str, np.ndarray, np.ndarray | None] | None]",
 ) -> None:
     for path in files:
         try:
@@ -211,41 +214,6 @@ def image_loader_thread(
         except Exception as e:
             console.print(f"[red]Failed to load {path}: {e}[/]")
     job_q.put(None)
-
-
-def collect_input_files(
-    input_path: str, exts: set[str], temp_dir: str | None = None
-) -> list[str]:
-    """
-    Collect input files from a path, which can be:
-    - A local file path
-    - A local directory path
-    - A single URL (http:// or https://)
-
-    For URLs, downloads to temp_dir and returns the temp file path.
-    """
-    # Handle URL input
-    if is_url(input_path):
-        if temp_dir is None:
-            raise ValueError("temp_dir required for URL input")
-        temp_path = download_image_to_temp(input_path, temp_dir)
-        return [temp_path]
-
-    # Handle local paths
-    if not os.path.exists(input_path):
-        raise FileNotFoundError(input_path)
-
-    if os.path.isdir(input_path):
-        return [
-            os.path.join(input_path, f)
-            for f in sorted(os.listdir(input_path))
-            if os.path.splitext(f)[1].lower() in exts
-        ]
-
-    ext = os.path.splitext(input_path)[1].lower()
-    if ext not in exts:
-        raise RuntimeError(f"Unsupported extension: {input_path}")
-    return [input_path]
 
 
 def main() -> None:
@@ -275,7 +243,24 @@ def main() -> None:
             raise RuntimeError(f"No images in {cfg['INPUT_PATH']}")
 
         os.makedirs(cfg["OUTPUT_DIR"], exist_ok=True)
-        console.print(f"[bold]Found {len(files)} image(s)[/]")
+
+        total_found = len(files)
+        console.print(f"[bold]Found {total_found} image(s)[/]")
+
+        # Filter out files with existing outputs if skip_existing is enabled
+        skipped_count = 0
+        if cfg["SKIP_EXISTING"]:
+            files, skipped_count = filter_existing_outputs(
+                files, cfg["OUTPUT_DIR"], cfg["NOTE"], cfg["OUTPUT_FORMAT"]
+            )
+            if skipped_count > 0:
+                console.print(
+                    f"[yellow]Skipping {skipped_count} file(s) with existing outputs[/]"
+                )
+            if not files:
+                console.print("[green]All outputs already exist, nothing to do.[/]")
+                vram_monitor.stop()
+                return
 
         console.print("\n[bold]Initializing TensorRT...[/]")
         upscaler = TensorRTUpscaler(
@@ -345,16 +330,8 @@ def main() -> None:
 
                 dbg(f"{os.path.basename(path)}: {time.perf_counter() - t0:.2f}s")
 
-                out_base = os.path.splitext(os.path.basename(path))[0]
-                ext_map = {
-                    "png": ".png",
-                    "jpg": ".jpg",
-                    "webp": ".webp",
-                    "avif": ".avif",
-                }
-                out_ext = ext_map[cfg["OUTPUT_FORMAT"]]
-                out_path = os.path.join(
-                    cfg["OUTPUT_DIR"], f"{out_base}_{cfg['NOTE']}{out_ext}"
+                out_path = get_output_path(
+                    path, cfg["OUTPUT_DIR"], cfg["NOTE"], cfg["OUTPUT_FORMAT"]
                 )
 
                 save_q.put((result_rgb, alpha, out_path))
@@ -384,6 +361,8 @@ def main() -> None:
     total_runtime = time.perf_counter() - total_t0
     console.print("\n[bold]===== Summary =====[/]")
     console.print(f"Images processed : {total}")
+    if skipped_count > 0:
+        console.print(f"Images skipped   : {skipped_count}")
     console.print(f"Total run time   : {format_hms(total_runtime)}")
     if total > 0:
         console.print(f"Average time     : {total_runtime / total:.2f}s / image")

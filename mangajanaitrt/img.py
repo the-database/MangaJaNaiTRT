@@ -187,3 +187,71 @@ def save_image(
 
     else:
         img.pngsave(path, compression=6)
+
+
+def collect_input_files(
+        input_path: str, exts: set[str], temp_dir: str | None = None
+) -> list[str]:
+    """
+    Collect input files from a path, which can be:
+    - A local file path
+    - A local directory path
+    - A single URL (http:// or https://)
+
+    For URLs, downloads to temp_dir and returns the temp file path.
+    """
+    # Handle URL input
+    if is_url(input_path):
+        if temp_dir is None:
+            raise ValueError("temp_dir required for URL input")
+        temp_path = download_image_to_temp(input_path, temp_dir)
+        return [temp_path]
+
+    # Handle local paths
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(input_path)
+
+    if os.path.isdir(input_path):
+        return [
+            os.path.join(input_path, f)
+            for f in sorted(os.listdir(input_path))
+            if os.path.splitext(f)[1].lower() in exts
+        ]
+
+    ext = os.path.splitext(input_path)[1].lower()
+    if ext not in exts:
+        raise RuntimeError(f"Unsupported extension: {input_path}")
+    return [input_path]
+
+
+def get_output_path(
+        input_path: str, output_dir: str, note: str, output_format: str
+) -> str:
+    """Generate the output path for a given input file."""
+    ext_map = {
+        "png": ".png",
+        "jpg": ".jpg",
+        "webp": ".webp",
+        "avif": ".avif",
+    }
+    out_ext = ext_map[output_format]
+    out_base = os.path.splitext(os.path.basename(input_path))[0]
+    return os.path.join(output_dir, f"{out_base}_{note}{out_ext}")
+
+
+def filter_existing_outputs(
+        files: list[str], output_dir: str, note: str, output_format: str
+) -> tuple[list[str], int]:
+    """
+    Filter out files whose outputs already exist.
+    Returns (files_to_process, num_skipped).
+    """
+    to_process = []
+    skipped = 0
+    for path in files:
+        out_path = get_output_path(path, output_dir, note, output_format)
+        if os.path.exists(out_path):
+            skipped += 1
+        else:
+            to_process.append(path)
+    return to_process, skipped
