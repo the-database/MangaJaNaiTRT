@@ -404,6 +404,7 @@ class TensorRTUpscaler:
                 self._set_input_shape(infer_h, infer_w)
 
             input_buf[0] = cp.asarray(tile_data, dtype=self.input_cp_dtype)
+            cp.cuda.get_current_stream().synchronize()
 
             self.context.set_tensor_address(self.input_name, input_buf.data.ptr)
             self.context.set_tensor_address(self.output_name, output_buf.data.ptr)
@@ -452,6 +453,7 @@ class TensorRTUpscaler:
                 self._set_input_shape(infer_h, infer_w)
 
             input_buf[0] = cp.asarray(tile_data, dtype=self.input_cp_dtype)
+            cp.cuda.get_current_stream().synchronize()
 
             self.context.set_tensor_address(self.input_name, input_buf.data.ptr)
             self.context.set_tensor_address(self.output_name, output_buf.data.ptr)
