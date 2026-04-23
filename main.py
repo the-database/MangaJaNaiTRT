@@ -11,7 +11,6 @@ from queue import Queue, Empty
 warnings.filterwarnings("ignore", message="CUDA path could not be detected")
 
 import numpy as np
-import pyvips
 from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
@@ -29,6 +28,8 @@ from mangajanaitrt.img import (
     get_output_path,
     filter_existing_outputs,
     collect_input_files,
+    with_black_and_white_backgrounds,
+    denoise_and_flatten_alpha,
 )
 from mangajanaitrt.trt_upscaler import TensorRTUpscaler
 from mangajanaitrt.vram_monitor import MultiGPUVRAMMonitor
@@ -189,22 +190,17 @@ def make_progress() -> Progress:
     )
 
 
-def upscale_alpha(alpha: np.ndarray, scale: int) -> np.ndarray:
-    h, w = alpha.shape
-    img = pyvips.Image.new_from_memory(alpha.tobytes(), w, h, 1, "uchar")
-    img = img.resize(scale, kernel="cubic")
-    return np.ndarray(
-        buffer=img.write_to_memory(), dtype=np.uint8, shape=[img.height, img.width]
-    )
-
-
 def image_writer_thread(
     save_queue: "Queue[tuple[np.ndarray, np.ndarray | None, str, int] | None]",
     quality: int,
     webp_lossless: bool,
-    scale: int,
 ) -> None:
-    """Writer thread that saves completed images to disk."""
+    """Writer thread that saves completed images to disk.
+
+    Alpha (if present) is already at output resolution — the GPU worker either
+    upscales it via the black/white background trick or synthesizes it from a
+    uniform alpha value.
+    """
     while True:
         item = save_queue.get()
         if item is None:
@@ -212,8 +208,7 @@ def image_writer_thread(
             break
         rgb, alpha, out_path, _scale = item
         if alpha is not None:
-            result_alpha = upscale_alpha(alpha, scale)
-            out_arr = np.dstack([rgb, result_alpha])
+            out_arr = np.dstack([rgb, alpha])
         else:
             out_arr = rgb
         save_image(out_arr, out_path, quality=quality, webp_lossless=webp_lossless)
@@ -293,10 +288,37 @@ def gpu_worker_thread(
 
         try:
             t0 = time.perf_counter()
-            result_rgb = upscaler.upscale_image(rgb, overlap=overlap)
+            if alpha is None:
+                result_rgb = upscaler.upscale_image(rgb, overlap=overlap)
+                result_alpha = None
+            else:
+                a_min = int(alpha.min())
+                a_max = int(alpha.max())
+                if a_min == a_max:
+                    # Uniform alpha — skip the 2-pass trick and synthesize at output size
+                    result_rgb = upscaler.upscale_image(rgb, overlap=overlap)
+                    if a_min >= 255:
+                        result_alpha = None
+                    else:
+                        h, w = result_rgb.shape[:2]
+                        result_alpha = np.full((h, w), a_min, dtype=np.uint8)
+                else:
+                    # chaiNNer-style transparency hack: composite against black and
+                    # white backgrounds, upscale both, recover alpha from the
+                    # difference. Premultiplied RGB is kept as-is (matches chaiNNer).
+                    black, white = with_black_and_white_backgrounds(rgb, alpha)
+                    black_up = upscaler.upscale_image(black, overlap=overlap)
+                    white_up = upscaler.upscale_image(white, overlap=overlap)
+
+                    # alpha = 1 - (white_up - black_up), in float per channel
+                    diff = white_up.astype(np.int16) - black_up.astype(np.int16)
+                    alpha_3 = np.clip(255 - diff, 0, 255).astype(np.uint8)
+                    result_alpha = denoise_and_flatten_alpha(alpha_3)
+                    result_rgb = black_up
+
             dbg(f"[GPU {device_id}] {os.path.basename(path)}: {time.perf_counter() - t0:.2f}s")
 
-            result_queue.put((path, result_rgb, alpha, scale))
+            result_queue.put((path, result_rgb, result_alpha, scale))
         except Exception as e:
             console.print(f"[red][GPU {device_id}] Failed to upscale {path}: {e}[/]")
 
@@ -364,7 +386,7 @@ def main() -> None:
     if not os.path.isfile(cfg["INPUT_ONNX"]):
         raise FileNotFoundError(f"ONNX not found: {cfg['INPUT_ONNX']}")
 
-    exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".avif"}
+    exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".avif", ".dds"}
 
     temp_dir = None
     input_is_url = is_url(cfg["INPUT_PATH"])
@@ -462,35 +484,9 @@ def main() -> None:
         num_savers = max(cfg["NUM_SAVE_THREADS"], num_gpus)
         writers = []
 
-        # We need the scale - peek it from first result or use a placeholder
-        # Actually, we pass scale in each result item, so writers get it per-image
-        # But upscale_alpha needs scale. Let's create a modified writer that uses per-item scale.
-
-        # For simplicity, we'll determine scale after first GPU initializes
-        # The scale is in the result tuple, so writers use it from there.
-
-        # Modified writer that accepts scale per item:
-        def image_writer_thread_v2(
-            sq: "Queue[tuple[np.ndarray, np.ndarray | None, str, int] | None]",
-            quality: int,
-            webp_lossless: bool,
-        ) -> None:
-            while True:
-                item = sq.get()
-                if item is None:
-                    sq.put(None)
-                    break
-                rgb, alpha, out_path, scale = item
-                if alpha is not None:
-                    result_alpha = upscale_alpha(alpha, scale)
-                    out_arr = np.dstack([rgb, result_alpha])
-                else:
-                    out_arr = rgb
-                save_image(out_arr, out_path, quality=quality, webp_lossless=webp_lossless)
-
         for _ in range(num_savers):
             w = threading.Thread(
-                target=image_writer_thread_v2,
+                target=image_writer_thread,
                 args=(save_queue, cfg["QUALITY"], cfg["WEBP_LOSSLESS"]),
                 daemon=True,
             )
