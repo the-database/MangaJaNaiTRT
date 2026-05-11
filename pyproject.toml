@@ -6,11 +6,12 @@ dependencies = [
     "cupy-cuda12x",
     "numpy",
     "nvidia-ml-py",
+    "pillow",
     "pyvips",
     "pyvips-binary",
     "requests",
     "rich",
-    "tensorrt-cu12",
+    "tensorrt-cu12>=10.15.1.29",
     "urllib3"
 ]
 authors = [{name = "the-database"}]

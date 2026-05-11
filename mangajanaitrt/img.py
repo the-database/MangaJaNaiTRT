@@ -101,7 +101,78 @@ def download_image_to_temp(url: str, temp_dir: str) -> str:
     return temp_path
 
 
+def with_black_and_white_backgrounds(
+    rgb: np.ndarray, alpha: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Composite an RGBA image against both a black and a white background.
+
+    Returns (black_bg, white_bg) as uint8 HxWx3 arrays. The pair lets a model
+    upscale the colour data with real continuity across the alpha boundary
+    instead of garbage values in transparent regions; alpha is later recovered
+    from the difference between the two upscaled outputs.
+    """
+    rgb_f = rgb.astype(np.float32) * (1.0 / 255.0)
+    alpha_f = (alpha.astype(np.float32) * (1.0 / 255.0))[:, :, np.newaxis]
+
+    black_f = rgb_f * alpha_f
+    white_f = (rgb_f - 1.0) * alpha_f + 1.0
+
+    black_u8 = np.clip(black_f * 255.0, 0, 255).astype(np.uint8)
+    white_u8 = np.clip(white_f * 255.0, 0, 255).astype(np.uint8)
+    return black_u8, white_u8
+
+
+def unpremultiply(rgb_premul: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+    """
+    Recover straight RGB from premultiplied RGB given the matching alpha.
+
+    PNG/WebP/TIFF expect straight (unpremultiplied) RGB paired with straight
+    alpha; saving premultiplied RGB causes viewers to apply alpha a second
+    time, darkening semi-transparent regions.
+    """
+    rgb_f = rgb_premul.astype(np.float32)
+    alpha_f = alpha.astype(np.float32)[:, :, np.newaxis]
+    safe = np.maximum(alpha_f, 1.0)
+    out = rgb_f * (255.0 / safe)
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def denoise_and_flatten_alpha(alpha_3ch: np.ndarray) -> np.ndarray:
+    """
+    Collapse a per-channel alpha estimate (HxWx3 uint8) into a single uint8
+    alpha channel using chaiNNer's denoise blend:
+
+        alpha = max * mean + min * (1 - mean)
+
+    This biases toward the extremes (max where mean is high, min where mean
+    is low) which suppresses model noise in semi-transparent regions.
+    """
+    a = alpha_3ch.astype(np.float32) * (1.0 / 255.0)
+    a_min = np.min(a, axis=2)
+    a_max = np.max(a, axis=2)
+    a_mean = np.mean(a, axis=2)
+    out = a_max * a_mean + a_min * (1.0 - a_mean)
+    return np.clip(out * 255.0, 0, 255).astype(np.uint8)
+
+
+def _load_dds(path: str) -> tuple[np.ndarray, np.ndarray | None]:
+    from PIL import Image
+
+    with Image.open(path) as im:
+        im.load()
+        mode = im.mode
+        if mode in ("RGBA", "LA"):
+            rgba = np.asarray(im.convert("RGBA"), dtype=np.uint8)
+            return np.ascontiguousarray(rgba[..., :3]), np.ascontiguousarray(rgba[..., 3])
+        rgb = np.asarray(im.convert("RGB"), dtype=np.uint8)
+        return np.ascontiguousarray(rgb), None
+
+
 def load_image(path: str) -> tuple[np.ndarray, np.ndarray | None]:
+    if os.path.splitext(path)[1].lower() == ".dds":
+        return _load_dds(path)
+
     img_peek = pyvips.Image.new_from_file(path, access="sequential")
     needs_alpha = img_peek.bands in (2, 4)
 
@@ -195,9 +266,8 @@ def collect_input_files(
     """
     Collect input files from a path, which can be:
     - A local file path
-    - A local directory path
+    - A local directory path (searched recursively)
     - A single URL (http:// or https://)
-
     For URLs, downloads to temp_dir and returns the temp file path.
     """
     # Handle URL input
@@ -206,18 +276,16 @@ def collect_input_files(
             raise ValueError("temp_dir required for URL input")
         temp_path = download_image_to_temp(input_path, temp_dir)
         return [temp_path]
-
     # Handle local paths
     if not os.path.exists(input_path):
         raise FileNotFoundError(input_path)
-
     if os.path.isdir(input_path):
-        return [
-            os.path.join(input_path, f)
-            for f in sorted(os.listdir(input_path))
-            if os.path.splitext(f)[1].lower() in exts
-        ]
-
+        files = []
+        for root, _, filenames in os.walk(input_path):
+            for f in filenames:
+                if os.path.splitext(f)[1].lower() in exts:
+                    files.append(os.path.join(root, f))
+        return sorted(files)
     ext = os.path.splitext(input_path)[1].lower()
     if ext not in exts:
         raise RuntimeError(f"Unsupported extension: {input_path}")
@@ -236,7 +304,8 @@ def get_output_path(
     }
     out_ext = ext_map[output_format]
     out_base = os.path.splitext(os.path.basename(input_path))[0]
-    return os.path.join(output_dir, f"{out_base}_{note}{out_ext}")
+    suffix = f"_{note}" if note else ""
+    return os.path.join(output_dir, f"{out_base}{suffix}{out_ext}")
 
 
 def filter_existing_outputs(
