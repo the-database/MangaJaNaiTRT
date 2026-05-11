@@ -30,6 +30,7 @@ from mangajanaitrt.img import (
     collect_input_files,
     with_black_and_white_backgrounds,
     denoise_and_flatten_alpha,
+    unpremultiply,
 )
 from mangajanaitrt.trt_upscaler import TensorRTUpscaler
 from mangajanaitrt.vram_monitor import MultiGPUVRAMMonitor
@@ -303,9 +304,12 @@ def gpu_worker_thread(
                         h, w = result_rgb.shape[:2]
                         result_alpha = np.full((h, w), a_min, dtype=np.uint8)
                 else:
-                    # chaiNNer-style transparency hack: composite against black and
-                    # white backgrounds, upscale both, recover alpha from the
-                    # difference. Premultiplied RGB is kept as-is (matches chaiNNer).
+                    # chaiNNer-style transparency hack: composite against black
+                    # and white backgrounds, upscale both, recover alpha from
+                    # the difference. Then unpremultiply — chaiNNer skips this
+                    # step and ships premultiplied RGB, which darkens semi-
+                    # transparent pixels in any viewer doing straight-alpha
+                    # compositing (which is what PNG/WebP/TIFF specify).
                     black, white = with_black_and_white_backgrounds(rgb, alpha)
                     black_up = upscaler.upscale_image(black, overlap=overlap)
                     white_up = upscaler.upscale_image(white, overlap=overlap)
@@ -314,7 +318,7 @@ def gpu_worker_thread(
                     diff = white_up.astype(np.int16) - black_up.astype(np.int16)
                     alpha_3 = np.clip(255 - diff, 0, 255).astype(np.uint8)
                     result_alpha = denoise_and_flatten_alpha(alpha_3)
-                    result_rgb = black_up
+                    result_rgb = unpremultiply(black_up, result_alpha)
 
             dbg(f"[GPU {device_id}] {os.path.basename(path)}: {time.perf_counter() - t0:.2f}s")
 

@@ -123,6 +123,21 @@ def with_black_and_white_backgrounds(
     return black_u8, white_u8
 
 
+def unpremultiply(rgb_premul: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+    """
+    Recover straight RGB from premultiplied RGB given the matching alpha.
+
+    PNG/WebP/TIFF expect straight (unpremultiplied) RGB paired with straight
+    alpha; saving premultiplied RGB causes viewers to apply alpha a second
+    time, darkening semi-transparent regions.
+    """
+    rgb_f = rgb_premul.astype(np.float32)
+    alpha_f = alpha.astype(np.float32)[:, :, np.newaxis]
+    safe = np.maximum(alpha_f, 1.0)
+    out = rgb_f * (255.0 / safe)
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
 def denoise_and_flatten_alpha(alpha_3ch: np.ndarray) -> np.ndarray:
     """
     Collapse a per-channel alpha estimate (HxWx3 uint8) into a single uint8
