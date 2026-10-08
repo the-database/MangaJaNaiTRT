@@ -231,7 +231,11 @@ class TensorRTUpscaler:
             console.print(f"[cyan]Loading cached engine: {Path(engine_path).name}[/]")
             with open(engine_path, "rb") as f:
                 runtime = trt.Runtime(self.logger)
-                return runtime.deserialize_cuda_engine(f.read())
+                engine = runtime.deserialize_cuda_engine(f.read())
+            if engine is not None:
+                return engine
+            # e.g. engine was built by a different TensorRT version
+            console.print("[yellow]Cached engine is incompatible, rebuilding...[/]")
 
         console.print(
             "[yellow]Building TensorRT engine (may take several minutes)...[/]"
@@ -251,7 +255,7 @@ class TensorRTUpscaler:
         try:
             builder = trt.Builder(self.logger)
 
-            flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+            flags = 0
             if self.use_strong_types and hasattr(
                 trt.NetworkDefinitionCreationFlag, "STRONGLY_TYPED"
             ):
