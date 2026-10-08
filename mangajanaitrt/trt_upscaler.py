@@ -1,4 +1,5 @@
 import os
+from configparser import ConfigParser
 from pathlib import Path
 
 import cupy as cp
@@ -26,15 +27,27 @@ def onnx_conv_info(onnx_path: str):
     return info
 
 
+# Precision options from TRT 10 and earlier. TRT 11+ is always strongly typed, so
+# precision comes from the ONNX model and these config keys no longer do anything.
+IGNORED_TRT_OPTIONS = ("use_fp16", "use_bf16", "use_strong_types")
+
+
+def warn_ignored_trt_options(cfg: ConfigParser) -> None:
+    found = [opt for opt in IGNORED_TRT_OPTIONS if cfg.has_option("trt", opt)]
+    if found:
+        console.print(
+            f"[yellow]Warning: {', '.join(found)} in \\[trt] ignored. TensorRT 11+ "
+            "always uses the precision defined in the ONNX model; use an fp16/bf16 "
+            "ONNX for reduced precision.[/]"
+        )
+
+
 class TensorRTUpscaler:
     def __init__(
         self,
         onnx_path: str,
         batch_size: int = 1,
-        use_fp16: bool = True,
-        use_bf16: bool = False,
         *,
-        use_strong_types: bool = False,
         device_id: int = 0,
         engine_cache_dir: str | None = None,
         # (width, height)
@@ -47,9 +60,6 @@ class TensorRTUpscaler:
     ) -> None:
         self.onnx_path = onnx_path
         self.batch_size = batch_size
-        self.use_fp16 = use_fp16
-        self.use_bf16 = use_bf16
-        self.use_strong_types = use_strong_types
         self.device_id = device_id
         self.engine_cache_dir = engine_cache_dir or os.path.dirname(onnx_path)
 
@@ -137,7 +147,7 @@ class TensorRTUpscaler:
         )
         console.print(f"  Scale: {self.scale}x, Align: {self.tile_align}")
         console.print(
-            f"  Strong types: {self.use_strong_types} | IO dtypes: {self.input_trt_dtype} -> {self.output_trt_dtype}"
+            f"  IO dtypes: {self.input_trt_dtype} -> {self.output_trt_dtype}"
         )
 
     def _trt_dtype_to_cupy(self, trt_dtype):
@@ -154,14 +164,6 @@ class TensorRTUpscaler:
             return cp.bfloat16
 
         raise RuntimeError(f"Unsupported TensorRT tensor dtype: {trt_dtype}")
-
-    def _maybe_set_builder_flag(self, config, *names: str) -> bool:
-        """Try multiple enum names for compatibility across TRT / TRT-RTX."""
-        for n in names:
-            if hasattr(trt.BuilderFlag, n):
-                config.set_flag(getattr(trt.BuilderFlag, n))
-                return True
-        return False
 
     def _validate_dynamic_shapes(self) -> None:
         min_w, min_h = self.shape_min
@@ -194,13 +196,6 @@ class TensorRTUpscaler:
     def _get_engine_path(self) -> str:
         onnx_name = Path(self.onnx_path).stem
 
-        if self.use_strong_types:
-            precision = f"strong"
-        else:
-            precision = (
-                "bf16" if self.use_bf16 else ("fp16" if self.use_fp16 else "fp32")
-            )
-
         min_w, min_h = self.shape_min
         opt_w, opt_h = self.shape_opt
         max_w, max_h = self.shape_max
@@ -214,15 +209,8 @@ class TensorRTUpscaler:
 
         return os.path.join(
             self.engine_cache_dir,
-            f"{onnx_name}_{shape_str}_b{self.batch_size}_{precision}_{opt_str}.engine",
+            f"{onnx_name}_{shape_str}_b{self.batch_size}_{opt_str}.engine",
         )
-
-    def engine_precision_tag(self) -> str:
-        if self.use_bf16:
-            return "bf16"
-        if self.use_fp16:
-            return "fp16"
-        return "fp32"
 
     def _get_engine(self):
         engine_path = self._get_engine_path()
@@ -255,13 +243,8 @@ class TensorRTUpscaler:
         try:
             builder = trt.Builder(self.logger)
 
-            flags = 0
-            if self.use_strong_types and hasattr(
-                trt.NetworkDefinitionCreationFlag, "STRONGLY_TYPED"
-            ):
-                flags |= 1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
-
-            network = builder.create_network(flags)
+            # TRT 11+ networks are always strongly typed: precision comes from the ONNX
+            network = builder.create_network(0)
             parser = trt.OnnxParser(network, self.logger)
 
             with open(self.onnx_path, "rb") as f:
@@ -284,32 +267,6 @@ class TensorRTUpscaler:
                 console.print(
                     "[yellow]  Builder opt level not supported by this TRT version[/]"
                 )
-
-            if self.use_strong_types:
-                if self.use_bf16 or self.use_fp16:
-                    console.print(
-                        "[yellow]  Strong types enabled: ignoring FP16/BF16 builder flags; using ONNX-defined types[/]"
-                    )
-                else:
-                    console.print(
-                        "[yellow]  Strong types enabled: using ONNX-defined types (no precision flags)[/]"
-                    )
-            elif self.use_bf16 and builder.platform_has_fast_fp16:
-                if self._maybe_set_builder_flag(config, "BF16", "BF16Enable", "kBF16"):
-                    console.print("  Using BF16 precision")
-                else:
-                    console.print(
-                        "[yellow]  BF16 flag not available in this TRT build; falling back[/]"
-                    )
-            elif self.use_fp16 and builder.platform_has_fast_fp16:
-                if self._maybe_set_builder_flag(config, "FP16", "FP16Enable", "kFP16"):
-                    console.print("  Using FP16 precision")
-                else:
-                    console.print(
-                        "[yellow]  FP16 flag not available in this TRT build; falling back[/]"
-                    )
-            else:
-                console.print("  Using FP32 precision")
 
             profile = builder.create_optimization_profile()
             input_tensor = network.get_input(0)

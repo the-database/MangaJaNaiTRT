@@ -32,7 +32,7 @@ from mangajanaitrt.img import (
     denoise_and_flatten_alpha,
     unpremultiply,
 )
-from mangajanaitrt.trt_upscaler import TensorRTUpscaler
+from mangajanaitrt.trt_upscaler import TensorRTUpscaler, warn_ignored_trt_options
 from mangajanaitrt.vram_monitor import MultiGPUVRAMMonitor
 
 
@@ -75,9 +75,7 @@ def load_config(config_path: str | Path = "config.ini"):
     tile_overlap = cfg.getint("tiling", "tile_overlap", fallback=16)
 
     # [trt]
-    use_fp16 = cfg.getboolean("trt", "use_fp16", fallback=False)
-    use_bf16 = cfg.getboolean("trt", "use_bf16", fallback=True)
-    use_strong_types = cfg.getboolean("trt", "use_strong_types", fallback=False)
+    warn_ignored_trt_options(cfg)
     batch_size = cfg.getint("trt", "batch_size", fallback=1)
     trt_workspace_gb = cfg.getint("trt", "workspace_gb", fallback=4)
     trt_opt_level = cfg.getint("trt", "opt_level", fallback=3)
@@ -124,9 +122,6 @@ def load_config(config_path: str | Path = "config.ini"):
         "DYNAMIC_SHAPE_MAX": dynamic_shape_max,
         "TILE_ALIGN": tile_align,
         "TILE_OVERLAP": tile_overlap,
-        "USE_FP16": use_fp16,
-        "USE_BF16": use_bf16,
-        "USE_STRONG_TYPES": use_strong_types,
         "BATCH_SIZE": batch_size,
         "DEVICE_IDS": device_ids,
         "TRT_WORKSPACE_GB": trt_workspace_gb,
@@ -255,8 +250,6 @@ def gpu_worker_thread(
             upscaler = TensorRTUpscaler(
                 onnx_path=cfg["INPUT_ONNX"],
                 batch_size=cfg["BATCH_SIZE"],
-                use_fp16=cfg["USE_FP16"],
-                use_bf16=cfg["USE_BF16"],
                 device_id=device_id,
                 engine_cache_dir=cfg["ENGINE_CACHE_DIR"],
                 shape_min=cfg["DYNAMIC_SHAPE_MIN"],
@@ -265,7 +258,6 @@ def gpu_worker_thread(
                 tile_align=cfg["TILE_ALIGN"],
                 builder_opt_level=cfg["TRT_OPT_LEVEL"],
                 trt_workspace_gb=cfg["TRT_WORKSPACE_GB"],
-                use_strong_types=cfg["USE_STRONG_TYPES"],
             )
         scale = upscaler.scale
         ready_event.set()
