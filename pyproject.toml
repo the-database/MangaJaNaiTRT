@@ -4,14 +4,14 @@ requires-python = ">=3.13"
 dynamic = ["version"]
 dependencies = [
     "cupy-cuda12x>=14.2.0",
-    "numpy>=2.5.3",
+    "numpy>=2.5.4",
     "nvidia-ml-py>=13.615.71",
-    "pillow>=12.3.0",
+    "pillow>=13.0.0",
     "pyvips>=3.2.0",
     "pyvips-binary>=8.18.7",
     "requests>=2.34.2",
     "rich>=15.0.0",
-    "tensorrt-cu12>=11.3.0.99",
+    "tensorrt-cu12>=11.4.0.106",
     "urllib3>=2.8.0"
 ]
 authors = [{name = "the-database"}]
@@ -21,7 +21,7 @@ license-files = ["LICENSE"]
 keywords = ["machine learning", "deep learning", "neural network", "pytorch", "super resolution", "upscale", "image restoration" ]
 
 [project.optional-dependencies]
-dev = ["ruff>=0.16.10", "pyright>=1.1.414"]
+dev = ["ruff>=0.17.2", "pyright>=1.1.414"]
 
 [project.urls]
 Repository = "https://github.com/the-database/MangaJaNaiTRT.git"
