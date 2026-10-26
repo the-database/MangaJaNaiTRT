@@ -6,7 +6,7 @@ MangaJaNaiTRT is a simple command line tool to batch upscale images with ONNX mo
 
 ## Usage
 
-Python 3.13 is recommended. Once it's installed, clone the repo, set up dependencies and download ONNX models:
+Python 3.14 is recommended (3.13+ supported). Once it's installed, clone the repo, set up dependencies and download ONNX models:
 
 <details>
 <summary>Windows</summary>
