@@ -71,8 +71,16 @@ First run will build the TensorRT engine which may take several minutes. The `.e
 To use a different config file, specify it with the `-c` argument:
 
 ```bash
-python -c otherconfig.ini
+python main.py -c otherconfig.ini
 ```
+
+Engines are tied to the TensorRT version that built them. After upgrading TensorRT, stale engines are rebuilt automatically when used. To delete stale engines from the engine cache directory (the `.onnx` directory by default), run:
+
+```bash
+python main.py --clean-engines
+```
+
+Add `--dry-run` to list them without deleting.
 
 ## Resources
 - [OpenModelDB](https://openmodeldb.info/): Repository of AI upscaling models.

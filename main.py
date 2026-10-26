@@ -32,7 +32,11 @@ from mangajanaitrt.img import (
     denoise_and_flatten_alpha,
     unpremultiply,
 )
-from mangajanaitrt.trt_upscaler import TensorRTUpscaler, warn_ignored_trt_options
+from mangajanaitrt.trt_upscaler import (
+    TensorRTUpscaler,
+    clean_stale_engines,
+    warn_ignored_trt_options,
+)
 from mangajanaitrt.vram_monitor import MultiGPUVRAMMonitor
 
 
@@ -147,6 +151,16 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="config.ini",
         help="Path to config INI file (default: config.ini)",
+    )
+    parser.add_argument(
+        "--clean-engines",
+        action="store_true",
+        help="Delete cached engines built by a different TensorRT version, then exit",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="With --clean-engines, list stale engines without deleting them",
     )
     return parser.parse_args()
 
@@ -370,6 +384,12 @@ def main() -> None:
     total_t0 = time.perf_counter()
 
     cfg = load_config(args.config)
+
+    if args.clean_engines:
+        cache_dir = cfg["ENGINE_CACHE_DIR"] or os.path.dirname(cfg["INPUT_ONNX"]) or "."
+        clean_stale_engines(cache_dir, dry_run=args.dry_run)
+        return
+
     device_ids = cfg["DEVICE_IDS"]
     num_gpus = len(device_ids)
 

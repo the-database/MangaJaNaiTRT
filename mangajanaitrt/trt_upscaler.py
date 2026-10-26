@@ -42,6 +42,67 @@ def warn_ignored_trt_options(cfg: ConfigParser) -> None:
         )
 
 
+# Engine plan header (undocumented): b"ftrt" magic at offset 0, then one byte each
+# for the major/minor/patch/build TRT version that built it at offset 24.
+ENGINE_MAGIC = b"ftrt"
+ENGINE_VERSION_OFFSET = 24
+
+TrtVersion = tuple[int, int, int, int]
+
+
+def read_engine_trt_version(path: str | Path) -> TrtVersion | None:
+    """TRT version an engine was built with, or None if the header is unrecognized."""
+    try:
+        with open(path, "rb") as f:
+            header = f.read(ENGINE_VERSION_OFFSET + 4)
+    except OSError:
+        return None
+    if len(header) < ENGINE_VERSION_OFFSET + 4 or not header.startswith(ENGINE_MAGIC):
+        return None
+    major, minor, patch, build = header[ENGINE_VERSION_OFFSET:]
+    return major, minor, patch, build
+
+
+def current_trt_version() -> TrtVersion:
+    parts = [int(p) for p in trt.__version__.split(".")[:4]]
+    major, minor, patch, build = parts + [0] * (4 - len(parts))
+    # The header stores each component in a single byte
+    return major & 0xFF, minor & 0xFF, patch & 0xFF, build & 0xFF
+
+
+def format_trt_version(version: TrtVersion) -> str:
+    return ".".join(str(v) for v in version)
+
+
+def clean_stale_engines(cache_dir: str | Path, *, dry_run: bool = False) -> None:
+    """Delete engines in cache_dir built by a different TRT version than the installed one."""
+    current = current_trt_version()
+    engines = sorted(Path(cache_dir).glob("*.engine"))
+    stale = 0
+    for path in engines:
+        version = read_engine_trt_version(path)
+        if version is None:
+            console.print(
+                f"[yellow]Skipping {path.name}: unrecognized engine header[/]"
+            )
+            continue
+        if version == current:
+            continue
+        stale += 1
+        if not dry_run:
+            path.unlink()
+        action = "Would remove" if dry_run else "Removed"
+        console.print(
+            f"{action} {path.name} (built with TRT {format_trt_version(version)})"
+        )
+
+    result = "would be removed" if dry_run else "removed"
+    console.print(
+        f"[green]{stale} of {len(engines)} engine(s) in {cache_dir} {result} "
+        f"(installed TRT {trt.__version__})[/]"
+    )
+
+
 class TensorRTUpscaler:
     def __init__(
         self,
@@ -146,9 +207,7 @@ class TensorRTUpscaler:
             f"  Shape range (WxH): {self.shape_min} -> {self.shape_opt} -> {self.shape_max}"
         )
         console.print(f"  Scale: {self.scale}x, Align: {self.tile_align}")
-        console.print(
-            f"  IO dtypes: {self.input_trt_dtype} -> {self.output_trt_dtype}"
-        )
+        console.print(f"  IO dtypes: {self.input_trt_dtype} -> {self.output_trt_dtype}")
 
     def _trt_dtype_to_cupy(self, trt_dtype):
         if trt_dtype == trt.DataType.FLOAT:
@@ -216,14 +275,23 @@ class TensorRTUpscaler:
         engine_path = self._get_engine_path()
 
         if os.path.exists(engine_path):
-            console.print(f"[cyan]Loading cached engine: {Path(engine_path).name}[/]")
-            with open(engine_path, "rb") as f:
-                runtime = trt.Runtime(self.logger)
-                engine = runtime.deserialize_cuda_engine(f.read())
-            if engine is not None:
-                return engine
-            # e.g. engine was built by a different TensorRT version
-            console.print("[yellow]Cached engine is incompatible, rebuilding...[/]")
+            version = read_engine_trt_version(engine_path)
+            if version is not None and version != current_trt_version():
+                console.print(
+                    f"[yellow]Cached engine was built with TRT {format_trt_version(version)} "
+                    f"(installed {trt.__version__}), rebuilding...[/]"
+                )
+            else:
+                console.print(
+                    f"[cyan]Loading cached engine: {Path(engine_path).name}[/]"
+                )
+                with open(engine_path, "rb") as f:
+                    runtime = trt.Runtime(self.logger)
+                    engine = runtime.deserialize_cuda_engine(f.read())
+                if engine is not None:
+                    return engine
+                # e.g. built for a different GPU, or an unreadable header
+                console.print("[yellow]Cached engine is incompatible, rebuilding...[/]")
 
         console.print(
             "[yellow]Building TensorRT engine (may take several minutes)...[/]"
