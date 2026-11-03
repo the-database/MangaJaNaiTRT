@@ -1,5 +1,12 @@
 # MangaJaNaiTRT
 
+> **This repository is archived. Its successor is [MangaJaNaiCLI](https://github.com/the-database/MangaJaNaiCLI).**
+> MangaJaNaiCLI is a native command-line upscaler, a single download with no Python. It is built on the same parts as MangaJaNai GUI and runs on TensorRT, TensorRT-RTX or DirectML.
+> It adds archives (cbz/rar/7z), per-page model rules, grayscale handling, resizing and multiple GPUs, and keeps its settings in a `mangajanai.ini` file.
+> Its README maps this tool's `config.ini` settings to the new ones.
+>
+> MangaJaNaiTRT stays here as a simple, complete Python proof of concept of TensorRT upscaling.
+
 ## Overview
 
 MangaJaNaiTRT is a simple command line tool to batch upscale images with ONNX models using TensorRT. It was created as a proof of concept for fast and VRAM-efficient upscaling. If it works well enough its backend will be ported into [MangaJaNaiConverterGui](https://github.com/the-database/MangaJaNaiConverterGui). 
